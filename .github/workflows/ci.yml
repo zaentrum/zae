@@ -1,0 +1,24 @@
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.24" }
+      - run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - run: go test ./...
+      - run: go build ./...
+      # Neutrality: this is a public repo of the platform org. The binary must
+      # never name internal infrastructure or acquisition tooling — its whole
+      # design is that it learns capability from the instance, not from code.
+      - name: neutrality gate
+        run: |
+          H="$(printf '%s' 'nalet' '\.' 'cloud')|$(printf '%s' 'implentic' '\.' 'com')"
+          T1='nzb''get'; T2='qbit''torrent'; T3='son''arr'; T4='rad''arr'; T5='prow''larr'
+          ! grep -rniE "$H|\b($T1|$T2|$T3|$T4|$T5)\b" --include="*.go" --include="*.md" --include="*.sh" . \
+            || { echo "::error::internal hostname or acquisition tool name in the public CLI"; exit 1; }
