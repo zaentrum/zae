@@ -75,7 +75,7 @@ The binary splits in two, and the split is the point:
 | `zae discover` | ✅ works — and reports honestly when an instance has no discovery endpoint yet |
 | Instance-side capability discovery (`/api/portal/cli/discovery`) | ✅ served by portal-api; acquire is the first service declaring itself (10 commands) |
 | `zae login` (OIDC device flow) + role-gated commands | 🧭 next |
-| Registered checks, `events tail`, journey smoke tests, `addon lint` | 🧭 after discovery lands |
+| Registered checks, `events tail`, journey smoke tests, `addon lint` | 🧭 next, alongside login — discovery is in place |
 
 The platform-side design lives in the zaentrum docs:
 [Extending zaentrum](https://github.com/zaentrum/zaentrum/wiki/extending).
