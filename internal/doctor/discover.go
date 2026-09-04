@@ -94,7 +94,12 @@ func Discover(args []string) int {
 	}
 	fmt.Printf("capability schema v%d · %d service(s)\n\n", d.CapabilityVersion, len(d.Services))
 	for _, s := range d.Services {
-		fmt.Printf("%s (%s %s)\n", s.Service, s.Kind, s.Version)
+		// Version is optional in the schema; do not print the gap it leaves.
+		if s.Version != "" {
+			fmt.Printf("%s (%s %s)\n", s.Service, s.Kind, s.Version)
+		} else {
+			fmt.Printf("%s (%s)\n", s.Service, s.Kind)
+		}
 		for _, c := range s.Commands {
 			fmt.Printf("  zae %s %-18s %s\n", s.Service, c.Name, c.Summary)
 		}

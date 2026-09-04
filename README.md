@@ -11,9 +11,17 @@ $ zae doctor --url https://media.example.org
   ✓ routes                       3 public paths answer
   ✓ oidc issuer                  …/auth/realms/zaentrum serves discovery (advertised by /api/config)
   ✓ image registry               ghcr.io/zaentrum/portal-api:latest pulls anonymously
-  - capability discovery         not implemented by this instance yet — zae runs with its static core only
+  ✓ capability discovery         1 service(s) declare capabilities (schema v1)
 
 doctor: no failures
+
+$ zae discover --url https://media.example.org
+capability schema v1 · 1 service(s)
+
+acquire (addon)
+  zae acquire wanted             list requests and their state
+  zae acquire missing            the backlog: monitored, aired, still wanted
+  …
 ```
 
 ## Install
@@ -65,7 +73,7 @@ The binary splits in two, and the split is the point:
 |---|---|
 | `zae doctor` (outside-in static checks) | ✅ works today |
 | `zae discover` | ✅ works — and reports honestly when an instance has no discovery endpoint yet |
-| Instance-side capability discovery (`/api/portal/cli/discovery`) | 🧭 not yet served by the platform |
+| Instance-side capability discovery (`/api/portal/cli/discovery`) | ✅ served by portal-api; acquire is the first service declaring itself (10 commands) |
 | `zae login` (OIDC device flow) + role-gated commands | 🧭 next |
 | Registered checks, `events tail`, journey smoke tests, `addon lint` | 🧭 after discovery lands |
 
