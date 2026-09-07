@@ -22,8 +22,11 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/zaentrum/zae/internal/doctor"
+	"github.com/zaentrum/zae/internal/exitcode"
+	"github.com/zaentrum/zae/internal/invoke"
 )
 
 // version is stamped by the release build (-ldflags "-X main.version=v…").
@@ -35,7 +38,13 @@ func usage() {
 Usage:
   zae doctor --url https://your-instance.example   outside-in health of an instance
   zae discover --url https://…                     show the instance's capability surface
+  zae require <service>[.<command>] --url https://… assert the instance offers it (exit 0/3/4/6, silent)
+  zae <service> <command> --url https://… [--arg k=v] [--query k=v] [--data JSON]
   zae version
+
+Exit codes (stable, for scripts): 0 ran · 1 the instance returned an error ·
+2 usage · 3 not offered by this instance · 4 undetermined (could not find out —
+do NOT treat as removed) · 5 forbidden · 6 capability schema newer than zae.
 
 The command surface grows at runtime: services and addons on the instance you
 point zae at register their own commands and checks. 'zae discover' shows what
@@ -55,11 +64,19 @@ func main() {
 		os.Exit(doctor.Run(os.Args[2:], version))
 	case "discover":
 		os.Exit(doctor.Discover(os.Args[2:]))
+	case "require":
+		os.Exit(invoke.Require(os.Args[2:]))
 	case "help", "--help", "-h":
 		usage()
 	default:
-		fmt.Fprintf(os.Stderr, "zae: unknown command %q\n\n", os.Args[1])
-		usage()
-		os.Exit(2)
+		// Anything else is `zae <service> <command>`: resolved against the
+		// instance, never against this binary. A miss is reported by the
+		// instance's answer (exit 3/4), not as "unknown command" — that
+		// wording, and a usage dump, belong to typos in the static surface.
+		if len(os.Args) < 3 || strings.HasPrefix(os.Args[2], "-") {
+			fmt.Fprintf(os.Stderr, "zae: usage: %q is not a built-in command; instance commands are `zae <service> <command> --url …`\n", os.Args[1])
+			os.Exit(exitcode.Usage)
+		}
+		os.Exit(invoke.Run(os.Args[1], os.Args[2], os.Args[3:]))
 	}
 }
