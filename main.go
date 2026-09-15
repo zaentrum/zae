@@ -3,10 +3,11 @@
 // The design splits the binary in two, and the split is the point:
 //
 //   - a STATIC core — the commands that must work when the platform cannot
-//     speak for itself: preflight and outside-in diagnosis (doctor), and soon
-//     login. These ship in the binary because a service can only extend the
-//     CLI once it is running, and the moments you need doctor most are the
-//     moments nothing is.
+//     speak for itself: preflight and outside-in diagnosis (doctor), adding
+//     addons from a chart (addon), and soon login. These ship in the binary
+//     because a service can only extend the CLI once it is running, and the
+//     moments you need doctor most are the moments nothing is. An addon
+//     cannot declare the command that installs it.
 //   - a DISCOVERED surface — every service and addon will declare commands,
 //     checks and topics in a capability descriptor; the instance aggregates
 //     them and zae renders them at runtime. Installing an addon extends the
@@ -14,9 +15,9 @@
 //     worst a descriptor can do is describe an HTTP call zae then makes with
 //     the user's own token against the platform's own APIs.
 //
-// zae deliberately uses only the standard library. Three commands do not need
-// a framework, and the discovered surface will not either — it renders from
-// data.
+// zae deliberately uses only the standard library. A handful of commands do
+// not need a framework, and the discovered surface will not either — it
+// renders from data.
 package main
 
 import (
@@ -24,6 +25,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/zaentrum/zae/internal/addon"
 	"github.com/zaentrum/zae/internal/doctor"
 	"github.com/zaentrum/zae/internal/exitcode"
 	"github.com/zaentrum/zae/internal/invoke"
@@ -39,6 +41,8 @@ Usage:
   zae doctor --url https://your-instance.example   outside-in health of an instance
   zae discover --url https://…                     show the instance's capability surface
   zae require <service>[.<command>] --url https://… assert the instance offers it (exit 0/3/4/6, silent)
+  zae addon add <chart> --url https://… [flags]    plan an addon from a Helm chart, confirm, install
+  zae addon list|status|upgrade|remove …           manage addons installed from charts ('zae addon help')
   zae <service> <command> --url https://… [--arg k=v] [--query k=v] [--data JSON]
   zae version
 
@@ -66,6 +70,11 @@ func main() {
 		os.Exit(doctor.Discover(os.Args[2:]))
 	case "require":
 		os.Exit(invoke.Require(os.Args[2:]))
+	case "addon":
+		// Static, like doctor: installing is how an addon reaches the
+		// instance, so no addon can declare it. `addon` is therefore not
+		// available as a discovered service name.
+		os.Exit(addon.Run(os.Args[2:]))
 	case "help", "--help", "-h":
 		usage()
 	default:
