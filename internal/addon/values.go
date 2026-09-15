@@ -156,7 +156,7 @@ func readValues(src string) (map[string]any, error) {
 
 // parseValues accepts exactly one JSON object. YAML is refused rather than
 // guessed at: zae has no YAML parser, and a hand-rolled one would disagree
-// with Helm's about what "yes", "on" or "1.10" mean — the same file would then
+// with Helm's about what "yes", "on" or 0755 mean — the same file would then
 // install differently through zae than through helm. JSON is also valid YAML,
 // so a JSON values file works everywhere a chart's values do.
 func parseValues(b []byte, name string) (map[string]any, error) {
