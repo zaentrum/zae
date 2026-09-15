@@ -24,6 +24,7 @@ import (
 
 	"github.com/zaentrum/zae/internal/capability"
 	"github.com/zaentrum/zae/internal/exitcode"
+	"github.com/zaentrum/zae/internal/instance"
 )
 
 // proxyPrefix is how a service's paths are reached from OUTSIDE the cluster:
@@ -31,11 +32,6 @@ import (
 // registered app. Descriptor paths are service-relative by contract; the key
 // defaults to the service name (a descriptor may override it with proxyKey).
 const proxyPrefix = "/api/portal/apps/"
-
-// tokenEnv is the stopgap until `zae login` exists: a bearer minted elsewhere
-// (a service account, a browser session) is honored as-is. It is documented
-// as exactly that — a stopgap — not hidden.
-const tokenEnv = "ZAE_TOKEN"
 
 var placeholderRe = regexp.MustCompile(`\{([A-Za-z0-9_]+)\}`)
 
@@ -114,9 +110,7 @@ func Run(service, command string, args []string) int {
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if tok := os.Getenv(tokenEnv); tok != "" {
-		req.Header.Set("Authorization", "Bearer "+tok)
-	}
+	instance.Authorize(req)
 
 	resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(req)
 	if err != nil {
@@ -134,14 +128,11 @@ func Run(service, command string, args []string) int {
 		}
 		return exitcode.OK
 	case resp.StatusCode == 401 || resp.StatusCode == 403:
-		hint := "supply a bearer via " + tokenEnv + " (zae login is not available yet)"
-		if os.Getenv(tokenEnv) != "" {
-			hint = "the token in " + tokenEnv + " was refused"
-			if cmd.Role != "" {
-				hint += fmt.Sprintf(" — the command declares role %q", cmd.Role)
-			}
+		need := ""
+		if cmd.Role != "" {
+			need = fmt.Sprintf("the command declares role %q", cmd.Role)
 		}
-		errf("forbidden: %s %s is declared by %s but the instance answered %d — %s", service, command, base, resp.StatusCode, hint)
+		errf("forbidden: %s %s is declared by %s but the instance answered %d — %s", service, command, base, resp.StatusCode, instance.ForbiddenHint(need))
 		return exitcode.Forbidden
 	case resp.StatusCode == 404:
 		// The instance's surface may have changed since discovery. Ask again

@@ -11,12 +11,13 @@ import (
 
 	"github.com/zaentrum/zae/internal/capability"
 	"github.com/zaentrum/zae/internal/exitcode"
+	"github.com/zaentrum/zae/internal/instance"
 )
 
 // A fake instance: discovery declares one service with two commands, and the
 // proxied paths behave as the test dictates. Every exit code in the contract
 // gets exercised against it.
-func instance(t *testing.T, discoveryStatus int, schema int, handlers map[string]http.HandlerFunc) *httptest.Server {
+func fakeInstance(t *testing.T, discoveryStatus int, schema int, handlers map[string]http.HandlerFunc) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc(capability.Path, func(w http.ResponseWriter, r *http.Request) {
@@ -47,7 +48,7 @@ func capture(t *testing.T, fn func() int) (code int, out, errs string) {
 }
 
 func TestRunsAndPrintsBody(t *testing.T) {
-	srv := instance(t, 200, 1, map[string]http.HandlerFunc{
+	srv := fakeInstance(t, 200, 1, map[string]http.HandlerFunc{
 		"/api/things": func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, `[{"id":1}]`) },
 	})
 	defer srv.Close()
@@ -59,7 +60,7 @@ func TestRunsAndPrintsBody(t *testing.T) {
 
 func TestPlaceholderAndQuery(t *testing.T) {
 	var seen string
-	srv := instance(t, 200, 1, map[string]http.HandlerFunc{
+	srv := fakeInstance(t, 200, 1, map[string]http.HandlerFunc{
 		"/api/things/": func(w http.ResponseWriter, r *http.Request) { seen = r.URL.String(); fmt.Fprint(w, `{}`) },
 	})
 	defer srv.Close()
@@ -74,7 +75,7 @@ func TestPlaceholderAndQuery(t *testing.T) {
 // Usage errors are the SCRIPT's fault and must be exit 2 — never confused with
 // the instance's answer.
 func TestUsageErrors(t *testing.T) {
-	srv := instance(t, 200, 1, nil)
+	srv := fakeInstance(t, 200, 1, nil)
 	defer srv.Close()
 	cases := map[string][]string{
 		"missing --url":       {},
@@ -94,7 +95,7 @@ func TestUsageErrors(t *testing.T) {
 
 // The heart of the contract: not-offered is DEFINITIVE and says what is there.
 func TestNotOfferedIsDefinitiveAndInformative(t *testing.T) {
-	srv := instance(t, 200, 1, nil)
+	srv := fakeInstance(t, 200, 1, nil)
 	defer srv.Close()
 
 	code, _, errs := capture(t, func() int { return Run("nosuch", "list", []string{"--url", srv.URL}) })
@@ -118,7 +119,7 @@ func TestUndeterminedNeverReadsAsRemoved(t *testing.T) {
 		t.Fatalf("unreachable: want 4 + 'not concluding', got %d %q", code, errs)
 	}
 	// instance predates discovery
-	srv := instance(t, 404, 1, nil)
+	srv := fakeInstance(t, 404, 1, nil)
 	defer srv.Close()
 	code, _, errs = capture(t, func() int { return Run("sample", "list", []string{"--url", srv.URL}) })
 	if code != exitcode.Undetermined || !strings.Contains(errs, "does not implement") {
@@ -127,7 +128,7 @@ func TestUndeterminedNeverReadsAsRemoved(t *testing.T) {
 }
 
 func TestSchemaMismatchIsExit6(t *testing.T) {
-	srv := instance(t, 200, 2, nil)
+	srv := fakeInstance(t, 200, 2, nil)
 	defer srv.Close()
 	code, _, errs := capture(t, func() int { return Run("sample", "list", []string{"--url", srv.URL}) })
 	if code != exitcode.ContractMismatch || !strings.Contains(errs, "upgrade zae") {
@@ -136,18 +137,18 @@ func TestSchemaMismatchIsExit6(t *testing.T) {
 }
 
 func TestForbiddenIsExit5(t *testing.T) {
-	srv := instance(t, 200, 1, map[string]http.HandlerFunc{
+	srv := fakeInstance(t, 200, 1, map[string]http.HandlerFunc{
 		"/api/things": func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(401) },
 	})
 	defer srv.Close()
 	code, _, errs := capture(t, func() int { return Run("sample", "list", []string{"--url", srv.URL}) })
-	if code != exitcode.Forbidden || !strings.Contains(errs, tokenEnv) {
+	if code != exitcode.Forbidden || !strings.Contains(errs, instance.TokenEnv) {
 		t.Fatalf("want 5 mentioning the token env, got %d %q", code, errs)
 	}
 }
 
 func TestServerErrorIsExit1(t *testing.T) {
-	srv := instance(t, 200, 1, map[string]http.HandlerFunc{
+	srv := fakeInstance(t, 200, 1, map[string]http.HandlerFunc{
 		"/api/things": func(w http.ResponseWriter, r *http.Request) { http.Error(w, "boom", 500) },
 	})
 	defer srv.Close()
@@ -180,7 +181,7 @@ func TestExec404ReclassifiesWhenSurfaceChanged(t *testing.T) {
 }
 
 func TestRequire(t *testing.T) {
-	srv := instance(t, 200, 1, nil)
+	srv := fakeInstance(t, 200, 1, nil)
 	defer srv.Close()
 	for spec, want := range map[string]int{
 		"sample":        exitcode.OK,
