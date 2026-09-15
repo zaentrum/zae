@@ -130,7 +130,7 @@ installing example — follow it with zae addon status example --url https://med
   | `--set-secret-file path=FILE` | a file, one trailing newline trimmed |
   | `--secret-values FILE` or `-` | a JSON object of dotted path → string |
   | `--set-secret path=value` | the command line — visible to other local users in the process list, and kept in shell history |
-  | `--secret-ref path=name/key` (`add`) | a key of a values Secret kept by `remove --keep-values` |
+  | `--secret-ref path=name[/key]` (`add`) | a key of a values Secret kept by `remove --keep-values`; the key defaults to the path |
 
   They add to the secret inputs already set; `upgrade --clear-secret path`
   removes one.

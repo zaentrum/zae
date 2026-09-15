@@ -83,13 +83,17 @@ func TestParseSecretRefs(t *testing.T) {
 	if err != nil || refs["database.password"] != (secretRef{Name: "zaentrum-addon-example-values-x7k2p", Key: "database.password"}) {
 		t.Fatalf("parseSecretRefs: %v %v", refs, err)
 	}
+	refs, err = parseSecretRefs("example", []string{"database.password=zaentrum-addon-example-values-x7k2p"})
+	if err != nil || refs["database.password"].Key != "database.password" {
+		t.Fatalf("without /key the key is the path: %v %v", refs, err)
+	}
 	for _, arg := range []string{
 		"database.password", // no target
-		"database.password=zaentrum-addon-example-values-x7k2p", // no key
-		"database.password=platform-db/password",                // not the addon's values Secret
-		"database.password=zaentrum-addon-other-values-x/key",   // another addon's
-		"database.password=Zaentrum-addon-example-values-x/key", // not a Secret name
-		"database.password=zaentrum-addon-example-values-x/k y", // not a Secret key
+		"database.password=zaentrum-addon-example-values-x7k2p/", // an empty key
+		"database.password=platform-db/password",                 // not the addon's values Secret
+		"database.password=zaentrum-addon-other-values-x/key",    // another addon's
+		"database.password=Zaentrum-addon-example-values-x/key",  // not a Secret name
+		"database.password=zaentrum-addon-example-values-x/k y",  // not a Secret key
 		"bad path=zaentrum-addon-example-values-x/key",
 	} {
 		if _, err := parseSecretRefs("example", []string{arg}); err == nil {

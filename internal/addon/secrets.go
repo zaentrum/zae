@@ -34,9 +34,10 @@ var (
 //	--set-secret-file path=FILE  the file's content, one trailing newline trimmed
 //	--secret-values FILE|-       a JSON object of dotted path → string
 //
-// A fifth, --secret-ref path=name/key, sends no value at all: it points the
+// A fifth, --secret-ref path=name[/key], sends no value at all: it points the
 // input at a key of a values Secret the addon already has — one kept when the
-// addon was removed with its values.
+// addon was removed with its values. The key defaults to the path, which is
+// the key portal-api stores each secret input under.
 //
 // No message zae prints quotes a secret value: errors name the path, the file
 // or the flag, never what was in it.
@@ -166,7 +167,7 @@ type secretRef struct {
 	Key  string `json:"key"`
 }
 
-// parseSecretRefs reads --secret-ref path=name/key arguments for the addon
+// parseSecretRefs reads --secret-ref path=name[/key] arguments for the addon
 // name. Only the addon's own values Secrets can be named — the operator reads
 // nothing else — so a reference to anything else fails here, as usage.
 func parseSecretRefs(addon string, args []string) (map[string]secretRef, error) {
@@ -175,15 +176,18 @@ func parseSecretRefs(addon string, args []string) (map[string]secretRef, error) 
 	for _, arg := range args {
 		path, target, ok := strings.Cut(arg, "=")
 		if !ok {
-			return nil, fmt.Errorf("--secret-ref wants path=name/key")
+			return nil, fmt.Errorf("--secret-ref wants path=name or path=name/key")
 		}
 		if err := secretPath("secret-ref", path); err != nil {
 			return nil, err
 		}
-		name, key, ok := strings.Cut(target, "/")
+		name, key, hasKey := strings.Cut(target, "/")
+		if !hasKey {
+			key = path
+		}
 		switch {
-		case !ok || name == "" || key == "":
-			return nil, fmt.Errorf("--secret-ref %s: %q is not name/key", path, target)
+		case name == "" || key == "":
+			return nil, fmt.Errorf("--secret-ref %s: %q is not name or name/key", path, target)
 		case len(name) > 253 || !secretNameRe.MatchString(name):
 			return nil, fmt.Errorf("--secret-ref %s: %q is not a Secret name", path, name)
 		case !strings.HasPrefix(name, prefix):

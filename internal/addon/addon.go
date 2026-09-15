@@ -56,7 +56,7 @@ Usage:
   zae addon add <chart> --url https://… [--name N] [--version V] [--digest sha256:…]
       [--values FILE|-] [--set path=value]…
       [--set-secret path[=value]]… [--set-secret-file path=FILE]… [--secret-values FILE|-]
-      [--secret-ref path=name/key]… [--yes] [--wait] [--timeout 5m]
+      [--secret-ref path=name[/key]]… [--yes] [--wait] [--timeout 5m]
   zae addon list --url https://… [--json]
   zae addon status <name> --url https://… [--json]
   zae addon upgrade <name> --url https://… [--version V | --chart REF] [--digest sha256:…]
@@ -81,8 +81,8 @@ Secret inputs are stored in a Secret and never shown again:
   --secret-values FILE|-       a JSON object of dotted path → string
   --set-secret path=value      on the command line: visible in the process list
 They add to the secret inputs already set; --clear-secret path removes one.
---secret-ref path=name/key reuses a key of a values Secret kept by
-'remove --keep-values'.
+--secret-ref path=name[/key] reuses a key of a values Secret kept by
+'remove --keep-values' (the key defaults to the path).
 --wait waits until the addon is Ready and registered in the portal.
 
 Needs the platform's admin role: ZAE_TOKEN carries the bearer.
@@ -242,7 +242,7 @@ func add(args []string) int {
 	var secrets []secretArg
 	secretValuesSrc := secretFlags(fs, &secrets)
 	var refs multiFlag
-	fs.Var(&refs, "secret-ref", "path=name/key: a secret input kept in one of the addon's values Secrets, e.g. from a removal that kept them (repeatable)")
+	fs.Var(&refs, "secret-ref", "path=name[/key]: a secret input kept in one of the addon's values Secrets, e.g. from a removal that kept them; the key defaults to the path (repeatable)")
 	yes := fs.Bool("yes", false, "install without asking")
 	wait := fs.Bool("wait", false, "after installing, wait until the addon is Ready and registered")
 	timeout := fs.Duration("timeout", defaultTimeout, "how long each wait lasts: for the plan, and with --wait for Ready")
