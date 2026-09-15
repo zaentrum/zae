@@ -81,14 +81,15 @@ An addon is a standard Helm chart; the platform's operator installs it from one
 ```
 $ export ZAE_TOKEN=…   # an admin bearer
 $ zae addon add oci://ghcr.io/example/charts/example --version 1.2.0 \
-    --url https://media.example.org --set worker.replicas=2 --set-secret database.password=…
+    --url https://media.example.org --set worker.replicas=2 --set-secret database.password
+database.password (secret input, not shown):
 
 planning example from oci://ghcr.io/example/charts/example 1.2.0 on https://media.example.org …
 
 plan for example — chart example 1.2.0 — Planned
   description An example addon
   workloads
-    Deployment/example         ghcr.io/example/example:1.2.0  ports http 8080/TCP
+    Deployment/example         ghcr.io/example/example:1.2.0  ports 8080
     Deployment/example-worker  ghcr.io/example/worker:1.2.0
   objects     4 (Deployment 2, Secret 1, Service 1)
   inputs
@@ -96,37 +97,59 @@ plan for example — chart example 1.2.0 — Planned
     database.password  secret, required  set
     worker.replicas    value             2
 
-install example (example 1.2.0) on https://media.example.org? [y/N] y
+install example (chart example 1.2.0) on https://media.example.org? [y/N] y
 installing example — follow it with zae addon status example --url https://media.example.org
 ```
 
 | command | does |
 |---|---|
-| `zae addon add <chart> --url …` | creates the addon suspended, prints the operator's plan, asks, installs. `<chart>` is `oci://…` with `--version` (or `:tag`), or an `https://` link to a chart archive; `--digest sha256:…` pins the archive, `--name` overrides the name taken from the reference |
-| `zae addon list --url …` | every installed addon: chart or address, version, phase, ready components |
-| `zae addon status <name> --url …` | phase, what runs, components and the current plan |
-| `zae addon upgrade <name> --version V --url …` | plans the new version with its changes, asks, installs; `--chart` for a new reference. A running addon that is not upgraded — refused, declined, no plan in time — is put back to what it runs |
-| `zae addon remove <name> --url …` | deletes the addon and everything its chart applied; `--keep-values` keeps the Secret with its secret inputs |
+| `zae addon add <chart> --url …` | creates the addon suspended, prints the operator's plan for exactly that write, asks, installs. `<chart>` is `oci://…` with `--version` (or `:tag`), or an `https://` link to a chart archive; `--digest sha256:…` pins the archive; `--name` overrides the name taken from the reference, which zae derives exactly as the portal does |
+| `zae addon list --url …` | every installed addon: chart or address, the version asked for next to the one running, phase, ready components |
+| `zae addon status <name> --url …` | phase, the chart asked for and the one running, registration, components and the current plan |
+| `zae addon upgrade <name> --url …` | changes the chart (`--version`, `--chart`, `--digest`), values (`--set`, `--values`) or secret inputs (the secret flags, `--clear-secret`); plans first, shows the changes, asks, installs |
+| `zae addon remove <name> --url …` | deletes the addon and everything its chart applied; `--keep-values` keeps its values Secrets and its generated values for a later install |
 
 - **Nothing blocked is installed.** A plan the guardrails refused, or whose
   values fail the chart's `values.schema.json`, exits `1` — `--yes` included.
-- **Inputs.** `--values FILE` (or `-` for stdin) is one JSON object;
+  zae waits for the plan the operator made for the generation *its own* write
+  produced, never an older one; if someone else changes the addon meanwhile,
+  zae stops with `1`.
+- **Values.** `--values FILE` (or `-` for stdin) is one JSON object;
   `--set path=value` sets one dotted path — the value is JSON when it parses
-  as JSON, otherwise a string (`--set 'tag="1.10"'` forces a string);
-  `--set-secret path=value` sets a secret input, stored in a Secret and never
-  shown again — the plan says only *set* or *missing*. Like any argument, it
-  is visible in the local process list while zae runs and lands in shell
-  history if typed literally; read it into a variable first. Values are JSON, not
-  YAML: zae stays standard-library-only and does not guess YAML's types
-  differently from Helm (`yq -o=json values.yaml | zae addon add … --values - --yes`).
+  as JSON, otherwise a string (`--set 'tag="1.10"'` forces a string). `add`
+  starts from `--values`; `upgrade` changes the current values unless
+  `--values` replaces them. Values are JSON, not YAML: zae stays
+  standard-library-only and does not guess YAML's types differently from Helm
+  (`yq -o=json values.yaml | zae addon add … --values - --yes`).
+- **Secret inputs** are stored in a Secret and never shown again; the plan says
+  only *set* or *missing*:
+
+  | flag | the value comes from |
+  |---|---|
+  | `--set-secret path` | a prompt on the terminal, not echoed |
+  | `--set-secret-file path=FILE` | a file, one trailing newline trimmed |
+  | `--secret-values FILE` or `-` | a JSON object of dotted path → string |
+  | `--set-secret path=value` | the command line — visible to other local users in the process list, and kept in shell history |
+  | `--secret-ref path=name/key` (`add`) | a key of a values Secret kept by `remove --keep-values` |
+
+  They add to the secret inputs already set; `upgrade --clear-secret path`
+  removes one.
 - **Asking.** `add`, `upgrade` and `remove` ask on stdin. Without a terminal
-  there, or with `--values -`, they need `--yes` and exit `2` before writing
-  anything.
-- **Waiting.** `--wait` follows an install until the addon is Ready and exits
-  `1` if it is not after `--timeout` (default `5m`).
-- Exit codes follow the contract below: `3` means no such addon (or a
-  portal-api without the chart API), `4` that the instance could not be
-  reached, `5` a missing or refused admin bearer.
+  there they need `--yes`; stdin cannot carry a document and an answer, or two
+  documents, at once. Each of these exits `2` before anything is written.
+- **Upgrades put back what they do not install.** Refused, declined, no plan in
+  time, Ctrl-C or SIGTERM: zae re-reads the addon and restores the chart
+  reference, version, digest, values and suspension it read before writing —
+  unless someone else changed the addon since. Secret inputs cannot be put
+  back, because zae never reads their values; it says which ones stay as
+  written.
+- **Waiting.** `--wait` follows an install until the addon is Ready *and*
+  registered in the portal, and exits `1` — with the registration error, if
+  there is one — if it is not after `--timeout` (default `5m`).
+- Exit codes follow the contract below: `3` means no such addon, or an instance
+  that cannot install addons from charts (a portal-api without the API, a
+  cluster without the resource); `4` that the instance could not be reached;
+  `5` a missing or refused admin bearer; `130`/`143` interrupted.
 
 ## Exit codes — the scripting contract
 
