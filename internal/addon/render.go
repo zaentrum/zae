@@ -186,6 +186,7 @@ func renderInputs(w io.Writer, a *Addon) (missing []string) {
 		return nil
 	}
 	failed := len(a.Plan.ValuesErrors) > 0
+	values := a.valuesMap()
 	var plain []string
 	fmt.Fprintln(w, "  inputs")
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
@@ -194,7 +195,7 @@ func renderInputs(w io.Writer, a *Addon) (missing []string) {
 		if in.secret {
 			kind = "secret"
 		}
-		given, inValues := lookup(a.Values, in.path)
+		given, inValues := lookup(values, in.path)
 		inSecrets := slices.Contains(a.SecretKeys, in.path)
 		var state string
 		switch {
@@ -211,11 +212,11 @@ func renderInputs(w io.Writer, a *Addon) (missing []string) {
 			state = "default " + compactRaw(in.def)
 		case in.required && failed:
 			state = "missing"
-			flag := "--set"
+			hint := "--set " + in.path + "=…"
 			if in.secret {
-				flag = "--set-secret"
+				hint = "--set-secret " + in.path
 			}
-			missing = append(missing, fmt.Sprintf("%s %s=…", flag, in.path))
+			missing = append(missing, hint)
 		case in.required:
 			state = "from the chart's values"
 		default:
@@ -244,10 +245,23 @@ func renderStatus(w io.Writer, a *Addon) {
 	if a.Message != "" {
 		fmt.Fprintf(w, "  %s\n", a.Message)
 	}
+	if a.Chart != nil && a.Chart.Ref != "" {
+		label(w, "chart", chartLine(a.Chart))
+	}
 	if a.installed() {
 		label(w, "running", chartLine(a.LastAppliedChart))
 	} else {
 		label(w, "running", "nothing yet — never installed")
+	}
+	switch {
+	case a.Registered:
+		label(w, "registered", "yes")
+	case a.RegistrationError != "":
+		label(w, "registered", "no — "+a.RegistrationError)
+	case a.Phase == PhaseReady:
+		label(w, "registered", "not yet")
+	default:
+		label(w, "registered", "no — the portal registers it once it is Ready")
 	}
 	if len(a.Components) > 0 {
 		fmt.Fprintln(w, "  components")
@@ -266,8 +280,9 @@ func renderStatus(w io.Writer, a *Addon) {
 	}
 }
 
-// renderList prints every installed addon. Chart addons show their chart and
-// phase; addons installed from an address show the address.
+// renderList prints every installed addon. Chart addons show their chart, the
+// version asked for next to the one running, and their phase; addons installed
+// from an address show the address and the manifest's version.
 func renderList(w io.Writer, rows []Listed) {
 	if len(rows) == 0 {
 		fmt.Fprintln(w, "no addons installed")
@@ -280,19 +295,35 @@ func renderList(w io.Writer, rows []Listed) {
 		if name == "" {
 			name = r.Name
 		}
-		source, version, phase := r.ProxyURL, r.Version, "installed"
+		source, version, phase := r.ProxyURL, dash(r.Version), "installed"
 		if r.Chart != nil && r.Chart.Ref != "" {
 			source, phase = r.Chart.Ref, phaseOr(r.Phase)
-			if r.Chart.Version != "" {
-				version = r.Chart.Version
+			version = listVersion(r.Chart)
+			if !r.Registered && r.Phase == PhaseReady {
+				phase += ", not registered"
 			}
 		}
 		if r.Suspended {
 			phase += " (suspended)"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", name, dash(source), dash(version), phase, readyCount(r.Components))
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", name, dash(source), version, phase, readyCount(r.Components))
 	}
 	tw.Flush()
+}
+
+// listVersion is the version a chart addon asks for, with the one running
+// when that differs.
+func listVersion(c *listChart) string {
+	asked := dash(c.Version)
+	switch {
+	case c.LastApplied == nil || (c.LastApplied.Ref == "" && c.LastApplied.Version == ""):
+		return asked + " (not running)"
+	case c.LastApplied.Ref != c.Ref:
+		return asked + " (runs " + chartLine(c.LastApplied) + ")"
+	case c.LastApplied.Version != c.Version:
+		return asked + " (runs " + dash(c.LastApplied.Version) + ")"
+	}
+	return asked
 }
 
 // componentsLine is one progress line: each component's ready/desired.

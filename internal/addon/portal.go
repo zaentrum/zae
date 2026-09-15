@@ -2,7 +2,9 @@ package addon
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,9 +23,9 @@ const (
 	addonsPath = "/api/portal/addons"
 )
 
-// Phases of a ZaentrumAddon, as the operator reports them.
+// Phases of a ZaentrumAddon, as the operator reports them. An addon the
+// operator has not reconciled yet has no phase at all.
 const (
-	PhasePending    = "Pending"
 	PhasePlanned    = "Planned"
 	PhasePlanFailed = "PlanFailed"
 	PhaseInstalling = "Installing"
@@ -39,21 +41,24 @@ const adminNeed = "managing addons needs the platform's admin role"
 // status and the inputs it was given — secret inputs by path only, never by
 // value.
 type Addon struct {
-	Name             string         `json:"name"`
-	Suspended        bool           `json:"suspended"`
-	Phase            string         `json:"phase"`
-	Message          string         `json:"message"`
-	Plan             *Plan          `json:"plan"`
-	Components       []Component    `json:"components"`
-	LastAppliedChart *Chart         `json:"lastAppliedChart"`
-	Values           map[string]any `json:"values"`
-	SecretKeys       []string       `json:"secretKeys"`
-
-	// Not part of the v1 document. A portal that sends them gives zae the one
-	// exact way to tell a status written for the current spec from an older
-	// one, so they are used when present.
-	Generation         int64 `json:"generation"`
-	ObservedGeneration int64 `json:"observedGeneration"`
+	Name string `json:"name"`
+	// Chart is what the resource asks for; LastAppliedChart is what runs.
+	Chart            *Chart          `json:"chart"`
+	Suspended        bool            `json:"suspended"`
+	Phase            string          `json:"phase"`
+	Message          string          `json:"message"`
+	Plan             *Plan           `json:"plan"`
+	Components       []Component     `json:"components"`
+	LastAppliedChart *Chart          `json:"lastAppliedChart"`
+	Values           json.RawMessage `json:"values"`
+	SecretKeys       []string        `json:"secretKeys"`
+	// Generation is the resource's spec generation; ObservedGeneration the one
+	// the operator's status was written for. Together they tell a plan for the
+	// current spec from an older one.
+	Generation         int64  `json:"generation"`
+	ObservedGeneration int64  `json:"observedGeneration"`
+	Registered         bool   `json:"registered"`
+	RegistrationError  string `json:"registrationError"`
 }
 
 // installed: the operator has applied a chart for this addon at least once.
@@ -61,20 +66,35 @@ func (a *Addon) installed() bool {
 	return a.LastAppliedChart != nil && (a.LastAppliedChart.Ref != "" || a.LastAppliedChart.Version != "")
 }
 
-// current: the status was written for the current spec, as far as the
-// document can say.
-func (a *Addon) current() bool {
-	return a.Generation == 0 || a.ObservedGeneration >= a.Generation
+// spec is the chart the resource asks for, or the running one when a portal
+// does not say.
+func (a *Addon) spec() *Chart {
+	if a.Chart != nil && a.Chart.Ref != "" {
+		return a.Chart
+	}
+	return a.LastAppliedChart
+}
+
+// valuesMap decodes the non-secret values; numbers stay exact.
+func (a *Addon) valuesMap() map[string]any {
+	var m map[string]any
+	if len(bytes.TrimSpace(a.Values)) == 0 {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(a.Values))
+	dec.UseNumber()
+	_ = dec.Decode(&m)
+	return m
 }
 
 // Chart names a chart: what the resource asks for, or what actually runs.
 type Chart struct {
 	Ref     string `json:"ref"`
-	Version string `json:"version"`
-	Digest  string `json:"digest"`
+	Version string `json:"version,omitempty"`
+	Digest  string `json:"digest,omitempty"`
 }
 
-// Plan is what the operator would apply for the current spec.
+// Plan is what the operator would apply for the spec it observed.
 type Plan struct {
 	Chart        PlanChart  `json:"chart"`
 	ValuesSchema schemaDoc  `json:"valuesSchema"`
@@ -126,8 +146,8 @@ type Component struct {
 	Reason  string `json:"reason"`
 }
 
-// schemaDoc holds values.schema.json. The contract sends it as a string; an
-// object is accepted too, so a portal that inlines it still renders.
+// schemaDoc holds values.schema.json. The API sends it as a string; an object
+// is accepted too, so a portal that inlines it still renders.
 type schemaDoc string
 
 func (s *schemaDoc) UnmarshalJSON(b []byte) error {
@@ -144,17 +164,44 @@ func (s *schemaDoc) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// accepted answers every write: the generation the write produced — the one
+// a plan must be written for — and the chart the resource now asks for.
+type accepted struct {
+	Name               string `json:"name"`
+	Generation         int64  `json:"generation"`
+	ObservedGeneration int64  `json:"observedGeneration"`
+	Chart              *Chart `json:"chart"`
+}
+
+// removal answers DELETE /api/portal/addon-charts/{name}.
+type removal struct {
+	Name       string   `json:"name"`
+	Resource   bool     `json:"resource"`
+	KeptValues bool     `json:"keptValues"`
+	Warnings   []string `json:"warnings"`
+}
+
 // Listed is one row of GET /api/portal/addons: every installed addon, with
 // chart information merged in for chart addons.
 type Listed struct {
-	Key        string          `json:"key"`
-	Name       string          `json:"name"`
-	ProxyURL   string          `json:"proxyUrl"`
-	Version    string          `json:"version"`
-	Chart      *Chart          `json:"chart"`
-	Phase      string          `json:"phase"`
-	Suspended  bool            `json:"suspended"`
-	Components []listComponent `json:"components"`
+	Key               string          `json:"key"`
+	Name              string          `json:"name"`
+	ProxyURL          string          `json:"proxyUrl"`
+	Version           string          `json:"version"`
+	Chart             *listChart      `json:"chart"`
+	Phase             string          `json:"phase"`
+	Suspended         bool            `json:"suspended"`
+	Registered        bool            `json:"registered"`
+	RegistrationError string          `json:"registrationError"`
+	Components        []listComponent `json:"components"`
+}
+
+// listChart is a list row's chart: what the resource asks for, and what runs.
+type listChart struct {
+	Ref         string `json:"ref"`
+	Version     string `json:"version"`
+	Digest      string `json:"digest"`
+	LastApplied *Chart `json:"lastApplied"`
 }
 
 // listComponent tolerates both shapes the list carries: pointers that are null
@@ -171,11 +218,12 @@ type apiError struct {
 	code   int
 	msg    string
 	status int // the HTTP status, 0 when there was no answer
-	// transient: no answer, or the portal failing (5xx) — worth asking again
-	// while waiting, never a verdict about the addon.
+	// transient: no answer, or the portal failing for a moment — worth asking
+	// again while waiting, never a verdict about the addon.
 	transient bool
-	// notFound: the instance answered 404; noAPI: because it has no such
-	// route at all, not because the addon does not exist.
+	// notFound: the answer was 404. noAPI: the instance cannot manage chart
+	// addons at all — a portal-api without the API, or a cluster without the
+	// ZaentrumAddon resource — which no amount of waiting changes.
 	notFound, noAPI bool
 }
 
@@ -198,9 +246,9 @@ func newClient(base string) *client {
 }
 
 // do makes one call. in is sent as JSON when not nil; a 2xx body is decoded
-// into out when out is not nil. missing is the message for a 404 on a route
-// that exists; a 404 from a portal that has no such route says so instead.
-func (c *client) do(what, method, path string, in, out any, missing string) *apiError {
+// into out when out is not nil. missing is the message for a 404 about the
+// named addon. The error, when there is one, is an *apiError.
+func (c *client) do(ctx context.Context, what, method, path string, in, out any, missing string) error {
 	var body io.Reader
 	if in != nil {
 		b, err := json.Marshal(in)
@@ -209,7 +257,7 @@ func (c *client) do(what, method, path string, in, out any, missing string) *api
 		}
 		body = bytes.NewReader(b)
 	}
-	req, err := http.NewRequest(method, c.base+path, body)
+	req, err := http.NewRequestWithContext(ctx, method, c.base+path, body)
 	if err != nil {
 		return &apiError{code: exitcode.Usage, msg: fmt.Sprintf("usage: %s: %v", what, err)}
 	}
@@ -254,6 +302,8 @@ func (c *client) do(what, method, path string, in, out any, missing string) *api
 			missing = fmt.Sprintf("%s: %s answered 404: %s", what, c.base, excerpt(raw))
 		}
 		return &apiError{code: exitcode.NotOffered, status: s, notFound: true, msg: "not offered: " + missing}
+	case s == http.StatusServiceUnavailable:
+		return c.unavailable(ctx, what, raw)
 	case s >= 300 && s < 400:
 		return &apiError{code: exitcode.Failed, status: s,
 			msg: fmt.Sprintf("failed: %s: %s answered %d, redirecting to %s — use the instance's final address as --url; a sign-in page means the bearer in %s is missing", what, c.base, s, resp.Header.Get("Location"), instance.TokenEnv)}
@@ -263,10 +313,61 @@ func (c *client) do(what, method, path string, in, out any, missing string) *api
 	}
 }
 
+// clusterSilent opens the note portal-api gives when the cluster did not
+// answer it — the one unavailability that passes by itself.
+const clusterSilent = "the cluster did not answer"
+
+// unavailable classifies a 503. portal-api answers 503 both when the instance
+// cannot manage chart addons at all (outside a cluster, no ZaentrumAddon
+// resource, a Role without it) and when the cluster did not answer for a
+// moment. GET /api/portal/addon-charts says which: available, and if not, why.
+// "Cannot" is exit 3 and ends any wait; "not now" is asked again.
+func (c *client) unavailable(ctx context.Context, what string, raw []byte) error {
+	available, note, answered := c.probe(ctx)
+	switch {
+	case answered && !available && !strings.HasPrefix(note, clusterSilent):
+		return &apiError{code: exitcode.NotOffered, status: http.StatusServiceUnavailable, noAPI: true,
+			msg: fmt.Sprintf("not offered: %s cannot install addons from charts: %s", c.base, note)}
+	case answered && available:
+		// The API is there, and this call was refused by the cluster anyway —
+		// portal-api lacks a permission the call needs. Waiting does not help.
+		return &apiError{code: exitcode.Failed, status: http.StatusServiceUnavailable,
+			msg: fmt.Sprintf("failed: %s: %s answered 503: %s", what, c.base, excerpt(raw))}
+	default:
+		return &apiError{code: exitcode.Undetermined, status: http.StatusServiceUnavailable, transient: true,
+			msg: fmt.Sprintf("undetermined: %s: %s answered 503: %s", what, c.base, excerpt(raw))}
+	}
+}
+
+// probe asks GET /api/portal/addon-charts whether chart addons can be managed
+// here. answered is false for anything but a readable 200 — the probe never
+// classifies its own failure, so a 503 in front of it cannot loop.
+func (c *client) probe(ctx context.Context) (available bool, note string, answered bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+chartsPath, nil)
+	if err != nil {
+		return false, "", false
+	}
+	req.Header.Set("Accept", "application/json")
+	instance.Authorize(req)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return false, "", false
+	}
+	defer resp.Body.Close()
+	var body struct {
+		Available bool   `json:"available"`
+		Note      string `json:"note"`
+	}
+	if resp.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body) != nil {
+		return false, "", false
+	}
+	return body.Available, body.Note, true
+}
+
 // get reads one chart addon.
-func (c *client) get(name string) (*Addon, *apiError) {
+func (c *client) get(ctx context.Context, name string) (*Addon, error) {
 	var a Addon
-	if err := c.do("status of "+name, http.MethodGet, chartsPath+"/"+url.PathEscape(name), nil, &a,
+	if err := c.do(ctx, "status of "+name, http.MethodGet, namePath(name), nil, &a,
 		fmt.Sprintf("%s has no addon %q installed from a chart", c.base, name)); err != nil {
 		return nil, err
 	}
@@ -274,6 +375,15 @@ func (c *client) get(name string) (*Addon, *apiError) {
 		a.Name = name
 	}
 	return &a, nil
+}
+
+func namePath(name string) string { return chartsPath + "/" + url.PathEscape(name) }
+
+// asAPIError unwraps err into an *apiError, if it is one.
+func asAPIError(err error) (*apiError, bool) {
+	var ae *apiError
+	ok := errors.As(err, &ae)
+	return ae, ok
 }
 
 // excerpt is the instance's own message, trimmed for one line. portal-api

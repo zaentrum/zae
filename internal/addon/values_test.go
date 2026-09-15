@@ -4,13 +4,9 @@ import (
 	"encoding/json"
 	"flag"
 	"reflect"
-	"regexp"
 	"strings"
 	"testing"
 )
-
-// regexpLine reports whether any line of out matches re.
-func regexpLine(out, re string) bool { return regexp.MustCompile("(?m)" + re).MatchString(out) }
 
 func TestParseChart(t *testing.T) {
 	for _, tc := range []struct {
@@ -34,6 +30,7 @@ func TestParseChart(t *testing.T) {
 		"http://example.org/charts/example-1.2.0.tgz", // not https
 		"https://example.org",                         // no archive
 		"example",                                     // not a reference
+		"oci://ghcr.io/example/charts/example@sha256:" + strings.Repeat("a", 64), // a digest belongs in --digest
 	} {
 		if _, err := parseChart(raw, ""); err == nil {
 			t.Errorf("parseChart(%q) must be refused", raw)
@@ -44,17 +41,21 @@ func TestParseChart(t *testing.T) {
 	}
 }
 
-func TestDefaultName(t *testing.T) {
+// The name zae derives must be the name portal-api derives for the same
+// reference, character for character: settings and zae add the same addon.
+func TestDefaultNameMatchesThePortal(t *testing.T) {
 	for ref, want := range map[string]string{
-		"oci://ghcr.io/example/charts/example":                  "example",
-		"oci://ghcr.io/example/charts/example:1.2.0":            "example",
-		"oci://registry.example.org:5000/example-worker":        "example-worker",
-		"https://example.org/charts/example-1.2.0.tgz":          "example",
-		"https://example.org/charts/example-worker-1.2.0.tgz":   "example-worker",
-		"https://example.org/charts/example-2-1.0.0.tgz":        "example-2",
-		"https://example.org/charts/example-1.0.0-rc.1.tgz":     "example",
-		"https://example.org/charts/example-1.0.0-2.tgz":        "example",
-		"https://example.org/dl/example.tar.gz?sig=abc#section": "example",
+		"oci://ghcr.io/example/charts/example":                         "example",
+		"oci://registry.example.org:5000/example-worker":               "example-worker",
+		"oci://ghcr.io/example/charts/example-1.2.0":                   "example",
+		"https://example.org/charts/example-1.2.0.tgz":                 "example",
+		"https://example.org/charts/example-worker-v0.3.1-rc.1.tar.gz": "example-worker",
+		"https://example.org/charts/Example-1.2.0.tgz":                 "example",
+		"https://example.org/charts/example-2-1.0.0.tgz":               "example-2",
+		"https://example.org/charts/example-1.0.0+build.7.TGZ":         "example",
+		"https://example.org/dl/example.tar.gz?sig=abc#section":        "example",
+		"https://example.org/charts/":                                  "charts",
+		"https://example.org":                                          "",
 	} {
 		if got := defaultName(ref); got != want {
 			t.Errorf("defaultName(%q) = %q, want %q", ref, got, want)

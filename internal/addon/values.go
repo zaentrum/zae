@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"path"
 	"regexp"
 	"strings"
 )
@@ -31,8 +32,9 @@ var (
 	// through --values.
 	pathRe   = regexp.MustCompile(`^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$`)
 	digestRe = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
-	// A Helm chart version is SemVer 2 with MAJOR.MINOR.PATCH.
-	semverRe = regexp.MustCompile(`^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$`)
+	// archiveVersion is the "-1.2.0" (or "-v0.3.1-rc.1") a packaged chart's
+	// file name ends with — the same pattern portal-api strips.
+	archiveVersion = regexp.MustCompile(`-v?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]*)?$`)
 )
 
 func validName(s string) bool { return len(s) <= maxNameLen && dnsLabel.MatchString(s) }
@@ -67,7 +69,7 @@ func parseChart(raw, version string) (chartRef, error) {
 		c := chartRef{ref: raw, version: version, oci: true}
 		last := rest[slash+1:]
 		if strings.Contains(last, "@") {
-			return c, nil // pinned by manifest digest: the registry's business, passed as given
+			return chartRef{}, fmt.Errorf("%q pins a digest in the reference — give the version as the tag, and pin the chart archive with --digest sha256:…", raw)
 		}
 		if i := strings.LastIndex(last, ":"); i >= 0 {
 			tag := last[i+1:]
@@ -94,40 +96,33 @@ func parseChart(raw, version string) (chartRef, error) {
 	}
 }
 
-// defaultName derives the addon name from a chart reference: its last path
-// segment without tag, digest, archive extension or Helm's -<version> suffix.
-// oci://ghcr.io/example/charts/example:1.2.0 and
-// https://example.org/charts/example-1.2.0.tgz are both "example". zae
+// defaultName derives the addon name from a chart reference exactly as
+// portal-api does, so settings and zae name the same chart the same way: the
+// last path segment, without a tag or digest, without a .tar.gz or .tgz
+// extension, without a trailing -<version> (pre-release and build included),
+// lower-cased. oci://ghcr.io/example/charts/example:1.2.0 and
+// https://example.org/charts/Example-1.2.0.tgz are both "example". It returns
+// "" when the reference has no path; the caller then asks for --name. zae
 // always sends the name it derived, so the name it checks is the name used.
 func defaultName(ref string) string {
-	s := ref
-	if i := strings.Index(s, "://"); i >= 0 {
-		s = s[i+3:]
+	u, err := url.Parse(strings.TrimSpace(ref))
+	if err != nil {
+		return ""
 	}
-	if i := strings.IndexAny(s, "?#"); i >= 0 {
-		s = s[:i]
+	last := path.Base(strings.TrimRight(u.Path, "/"))
+	if last == "." || last == "/" {
+		return ""
 	}
-	s = strings.TrimRight(s, "/")
-	if i := strings.LastIndex(s, "/"); i >= 0 {
-		s = s[i+1:]
+	if i := strings.IndexAny(last, ":@"); i >= 0 {
+		last = last[:i]
 	}
-	if strings.HasPrefix(ref, "oci://") {
-		if i := strings.IndexAny(s, "@:"); i >= 0 {
-			s = s[:i]
-		}
-		return s
-	}
-	for _, ext := range []string{".tgz", ".tar.gz"} {
-		s = strings.TrimSuffix(s, ext)
-	}
-	// Archives are <name>-<version>.tgz. A chart name has no dots, so the
-	// version starts at the first "-<digit>" whose remainder is a version.
-	for i := 0; i+1 < len(s); i++ {
-		if s[i] == '-' && s[i+1] >= '0' && s[i+1] <= '9' && semverRe.MatchString(s[i+1:]) {
-			return s[:i]
+	for _, ext := range []string{".tar.gz", ".tgz"} {
+		if strings.HasSuffix(strings.ToLower(last), ext) {
+			last = last[:len(last)-len(ext)]
+			break
 		}
 	}
-	return s
+	return strings.ToLower(archiveVersion.ReplaceAllString(last, ""))
 }
 
 // readValues loads --values: one JSON object, from a file or from stdin ("-").
