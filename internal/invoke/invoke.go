@@ -105,12 +105,19 @@ func Run(service, command string, args []string) int {
 	if *data != "" {
 		body = bytes.NewBufferString(*data)
 	}
-	req, _ := http.NewRequestWithContext(context.Background(), method, target.String(), body)
+	ctx := context.Background()
+	req, _ := http.NewRequestWithContext(ctx, method, target.String(), body)
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	instance.Authorize(req)
+	if err := instance.Authorize(ctx, req, base); err != nil {
+		// zae has credentials for this instance and could not make them
+		// usable. That is an authentication failure, exit 5 — the command
+		// itself was never in doubt.
+		errf("forbidden: %s %s: %v", service, command, err)
+		return exitcode.Forbidden
+	}
 
 	resp, err := (&http.Client{Timeout: 60 * time.Second}).Do(req)
 	if err != nil {
@@ -132,7 +139,7 @@ func Run(service, command string, args []string) int {
 		if cmd.Role != "" {
 			need = fmt.Sprintf("the command declares role %q", cmd.Role)
 		}
-		errf("forbidden: %s %s is declared by %s but the instance answered %d — %s", service, command, base, resp.StatusCode, instance.ForbiddenHint(need))
+		errf("forbidden: %s %s is declared by %s but the instance answered %d — %s", service, command, base, resp.StatusCode, instance.ForbiddenHint(base, need))
 		return exitcode.Forbidden
 	case resp.StatusCode == 404:
 		// The instance's surface may have changed since discovery. Ask again

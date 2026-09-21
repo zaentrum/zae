@@ -432,6 +432,21 @@ func interrupt() {
 
 // run executes `zae addon …` with stdin input, a terminal or not, and the
 // answers a secret prompt would get.
+// Credentials are ambient: a stored session, or a ZAE_TOKEN in the shell
+// running `go test`, would change what these tests see. Point the credentials
+// file at a directory that starts empty and cannot be the developer's own.
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "zae-addon-test-config-")
+	if err != nil {
+		panic(err)
+	}
+	os.Setenv("XDG_CONFIG_HOME", dir)
+	os.Unsetenv(instance.TokenEnv)
+	code := m.Run()
+	os.RemoveAll(dir) // os.Exit skips defers
+	os.Exit(code)
+}
+
 func run(t *testing.T, input string, terminal bool, args ...string) (code int, out, errs string) {
 	t.Helper()
 	var ob, eb bytes.Buffer

@@ -85,7 +85,8 @@ They add to the secret inputs already set; --clear-secret path removes one.
 'remove --keep-values' (the key defaults to the path).
 --wait waits until the addon is Ready and registered in the portal.
 
-Needs the platform's admin role: ZAE_TOKEN carries the bearer.
+Needs the platform's admin role: sign in with 'zae login --url …', or carry a
+bearer in ZAE_TOKEN (which wins when it is set).
 Exit codes: 0 done · 1 refused, failed, declined or not Ready in time · 2 usage ·
 3 no such addon, or the instance cannot install addons from charts ·
 4 undetermined · 5 forbidden · 130/143 interrupted (an upgrade is put back first).

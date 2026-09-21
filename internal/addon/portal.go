@@ -265,7 +265,11 @@ func (c *client) do(ctx context.Context, what, method, path string, in, out any,
 	if in != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	instance.Authorize(req)
+	if err := instance.Authorize(ctx, req, c.base); err != nil {
+		// Credentials exist for this instance and could not be made usable —
+		// an authentication failure, not a verdict about the addon.
+		return &apiError{code: exitcode.Forbidden, msg: fmt.Sprintf("forbidden: %s: %v", what, err)}
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -286,7 +290,7 @@ func (c *client) do(ctx context.Context, what, method, path string, in, out any,
 		return nil
 	case s == http.StatusUnauthorized || s == http.StatusForbidden:
 		return &apiError{code: exitcode.Forbidden, status: s,
-			msg: fmt.Sprintf("forbidden: %s: %s answered %d — %s", what, c.base, s, instance.ForbiddenHint(adminNeed))}
+			msg: fmt.Sprintf("forbidden: %s: %s answered %d — %s", what, c.base, s, instance.ForbiddenHint(c.base, adminNeed))}
 	case s == http.StatusNotFound:
 		// A router's own 404 means the route is absent: a portal-api that
 		// predates it. Anything else is the API saying "no such addon".
@@ -348,7 +352,10 @@ func (c *client) probe(ctx context.Context) (available bool, note string, answer
 		return false, "", false
 	}
 	req.Header.Set("Accept", "application/json")
-	instance.Authorize(req)
+	// A probe classifies someone else's failure; it never classifies its own.
+	// An unusable credential here just means the probe asks anonymously and
+	// reports "could not tell", which is the answer that costs nothing.
+	_ = instance.Authorize(ctx, req, c.base)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return false, "", false
