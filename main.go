@@ -3,8 +3,8 @@
 // The design splits the binary in two, and the split is the point:
 //
 //   - a STATIC core — the commands that must work when the platform cannot
-//     speak for itself: preflight and outside-in diagnosis (doctor), adding
-//     addons from a chart (addon), and soon login. These ship in the binary
+//     speak for itself: preflight and outside-in diagnosis (doctor), signing
+//     in (login), adding addons from a chart (addon). These ship in the binary
 //     because a service can only extend the CLI once it is running, and the
 //     moments you need doctor most are the moments nothing is. An addon
 //     cannot declare the command that installs it.
@@ -26,6 +26,7 @@ import (
 	"strings"
 
 	"github.com/zaentrum/zae/internal/addon"
+	"github.com/zaentrum/zae/internal/auth"
 	"github.com/zaentrum/zae/internal/doctor"
 	"github.com/zaentrum/zae/internal/exitcode"
 	"github.com/zaentrum/zae/internal/invoke"
@@ -38,6 +39,9 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `zae — the zaentrum CLI
 
 Usage:
+  zae login --url https://your-instance.example    sign in (device flow, opens a browser)
+  zae logout --url https://… | --all               forget a stored session
+  zae whoami --url https://…                       who zae's bearer says you are
   zae doctor --url https://your-instance.example   outside-in health of an instance
   zae discover --url https://…                     show the instance's capability surface
   zae require <service>[.<command>] --url https://… assert the instance offers it (exit 0/3/4/6, silent)
@@ -53,6 +57,9 @@ do NOT treat as removed) · 5 forbidden · 6 capability schema newer than zae.
 The command surface grows at runtime: services and addons on the instance you
 point zae at register their own commands and checks. 'zae discover' shows what
 this instance offers; nothing addon-specific is compiled into this binary.
+
+Credentials: 'zae login' stores a session per instance under ~/.config/zae;
+ZAE_TOKEN, when set, is sent instead — for service accounts and CI.
 `)
 }
 
@@ -64,6 +71,14 @@ func main() {
 	switch os.Args[1] {
 	case "version", "--version", "-v":
 		fmt.Println("zae", version)
+	case "login":
+		// Static, like doctor: signing in is what makes everything else
+		// possible, so it cannot be a command an instance declares.
+		os.Exit(auth.Login(os.Args[2:]))
+	case "logout":
+		os.Exit(auth.Logout(os.Args[2:]))
+	case "whoami":
+		os.Exit(auth.Whoami(os.Args[2:]))
 	case "doctor":
 		os.Exit(doctor.Run(os.Args[2:], version))
 	case "discover":

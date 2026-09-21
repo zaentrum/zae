@@ -52,8 +52,22 @@ type Descriptor struct {
 	Topics   []string  `json:"topics"`
 }
 
+// Auth is how a CLI signs in to this instance. zae cannot guess either half:
+// a shared realm registers per-instance clients, and the issuer may live
+// under a path prefix on the instance's own origin — so the instance says
+// both. Absent on an instance that predates the field, or that has nothing to
+// sign in to; `zae login` then needs --issuer and --client-id.
+type Auth struct {
+	Issuer   string `json:"issuer"`
+	ClientID string `json:"clientId"`
+}
+
+// Usable reports whether the instance said enough to attempt a login.
+func (a *Auth) Usable() bool { return a != nil && a.Issuer != "" && a.ClientID != "" }
+
 type Document struct {
 	CapabilityVersion int          `json:"capabilityVersion"`
+	Auth              *Auth        `json:"auth,omitempty"`
 	Services          []Descriptor `json:"services"`
 }
 
