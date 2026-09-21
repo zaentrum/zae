@@ -79,7 +79,7 @@ An addon is a standard Helm chart; the platform's operator installs it from one
 `zae addon` drives that through the portal's admin API — **plan first, always**:
 
 ```
-$ export ZAE_TOKEN=…   # an admin bearer
+$ zae login --url https://media.example.org   # or set ZAE_TOKEN to an admin bearer
 $ zae addon add oci://ghcr.io/example/charts/example --version 1.2.0 \
     --url https://media.example.org --set worker.replicas=2 --set-secret database.password
 database.password (secret input, not shown):
@@ -151,6 +151,73 @@ installing example — follow it with zae addon status example --url https://med
   cluster without the resource); `4` that the instance could not be reached;
   `5` a missing or refused admin bearer; `130`/`143` interrupted.
 
+## Signing in — `zae login`
+
+```
+$ zae login --url https://media.example.org
+signing in to https://media.example.org
+  identity provider: https://media.example.org/auth/realms/zaentrum
+  client:            zae
+
+open https://media.example.org/auth/realms/zaentrum/device?user_code=WDJB-MJHT
+  (it already carries the code; confirm that it shows WDJB-MJHT)
+
+waiting for you to finish in the browser (Ctrl-C to stop) …
+
+signed in to https://media.example.org
+  as         ada (8b1f-…)
+  admin role yes — the token carries "zaentrum-admin"
+  expires    Mon, 21 Sep 2026 21:48:23 CEST
+             renewed automatically while the session lives
+  stored in  /home/ada/.config/zae/credentials.json
+```
+
+It is the **OAuth 2.0 Device Authorization Grant**
+([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)) with PKCE: a CLI is a
+public client that cannot keep a secret and cannot receive a browser redirect,
+and the device grant is the one flow designed for exactly that. The browser
+that signs in does not have to be on this machine — which is what makes this
+work over ssh, in a container, or on a server with no desktop at all.
+
+`zae` compiles in no realm, no URL and no client id. The **instance** says
+which issuer it validates against and which client a CLI should use (the
+`auth` object in its discovery document); the **issuer** says where its
+endpoints are (`/.well-known/openid-configuration`). Nothing is built by
+string concatenation, because a realm may be served under a path prefix.
+
+| command | does |
+|---|---|
+| `zae login --url …` | signs in and stores the session. `--no-browser` prints the URL instead of opening one; `--issuer` and `--client-id` sign in to an instance that does not advertise them; `--scope` overrides the requested scopes |
+| `zae logout --url …` | forgets that instance's session; `--all` removes the file |
+| `zae whoami --url …` | subject, username, and whether the token carries the platform's admin role (`--role` names another). It never prints the token |
+
+**Where credentials live.** `~/.config/zae/credentials.json`
+(`$XDG_CONFIG_HOME/zae/credentials.json` when that is set), mode `0600` in a
+`0700` directory, keyed by instance URL — a session at one instance is
+worthless at another, and must never travel there. Each entry holds the access
+token, the refresh token, the expiry, the issuer and the client id.
+
+**Which bearer a command sends**, in order:
+
+1. `ZAE_TOKEN`, when set. A script that sets it is naming the identity it
+   means, and a developer's own login must not quietly override it.
+2. The stored session for that instance — renewed with its refresh token when
+   it has expired, and the renewal written back, so one expiry costs one extra
+   round trip and not one per command.
+
+If the renewal fails, the session ended: `zae` says *session expired — run:
+zae login --url …* and exits `5` rather than sending a token it knows is dead.
+A token that is real but lacks the role is a different message, because it
+needs a different fix: signing in again with the same account changes nothing.
+
+**Tokens are never printed.** Not by `login`, not by `whoami`, not in an error
+message — the one rule that keeps them out of scrollback, CI logs and pasted
+bug reports.
+
+**What an operator configures** — a public client (default id `zae`) with the
+device grant enabled, whose tokens carry realm roles: see
+[the CLI contract](https://github.com/zaentrum/zaentrum/blob/main/docs/extending/cli.md#what-an-operator-must-configure).
+
 ## Exit codes — the scripting contract
 
 A command can vanish between two runs of the same script because the
@@ -184,9 +251,8 @@ of failing halfway through. A 404 while *executing* re-discovers once and
 reclassifies (`3` if the command is now gone), so a stale view never surfaces
 as an inexplicable server error.
 
-**Authentication today** is a stopgap, stated as one: set `ZAE_TOKEN` to a
-bearer minted elsewhere (a service account's client-credentials token, for
-instance) and `zae` sends it. `zae login` (device flow) replaces this.
+**Authentication** is `zae login` — see below. `ZAE_TOKEN` still works and
+still wins, for service accounts and CI.
 
 ## Honest status
 
@@ -195,10 +261,10 @@ instance) and `zae` sends it. `zae login` (device flow) replaces this.
 | `zae doctor` (outside-in static checks) | ✅ works today |
 | `zae discover` | ✅ works — and reports honestly when an instance has no discovery endpoint yet |
 | Instance-side capability discovery (`/api/portal/cli/discovery`) | ✅ served by portal-api; acquire is the first service declaring itself (10 commands) |
-| Running discovered commands, with the exit-code contract and `zae require` | ✅ v0.2 — `ZAE_TOKEN` for auth until login lands |
+| Running discovered commands, with the exit-code contract and `zae require` | ✅ v0.2 |
 | `zae addon add/list/status/upgrade/remove` (charts installed by the operator) | 🔶 built against the addon chart API; needs an instance whose portal-api and operator ship it |
-| `zae login` (OIDC device flow) | 🧭 next |
-| Registered checks, `events tail`, journey smoke tests, `addon lint` | 🧭 next, alongside login — discovery is in place |
+| `zae login` / `logout` / `whoami` (device grant with PKCE, refresh, per-instance sessions) | 🔶 built; needs a portal-api that advertises `auth` and an operator-created public client |
+| Registered checks, `events tail`, journey smoke tests, `addon lint` | 🧭 next — discovery and login are in place |
 
 The platform-side design lives in the zaentrum docs:
 [Extending zaentrum](https://github.com/zaentrum/zaentrum/wiki/extending).
