@@ -30,6 +30,7 @@ import (
 	"github.com/zaentrum/zae/internal/doctor"
 	"github.com/zaentrum/zae/internal/exitcode"
 	"github.com/zaentrum/zae/internal/invoke"
+	"github.com/zaentrum/zae/internal/platform"
 )
 
 // version is stamped by the release build (-ldflags "-X main.version=v…").
@@ -47,6 +48,8 @@ Usage:
   zae require <service>[.<command>] --url https://… assert the instance offers it (exit 0/3/4/6, silent)
   zae addon add <chart> --url https://… [flags]    plan an addon from a Helm chart, confirm, install
   zae addon list|status|upgrade|remove …           manage addons installed from charts ('zae addon help')
+  zae platform status --url https://…              the platform's version, update and workloads
+  zae platform update|restart|scale …              drive platform updates ('zae platform help')
   zae <service> <command> --url https://… [--arg k=v] [--query k=v] [--data JSON]
   zae version
 
@@ -90,6 +93,10 @@ func main() {
 		// instance, so no addon can declare it. `addon` is therefore not
 		// available as a discovered service name.
 		os.Exit(addon.Run(os.Args[2:]))
+	case "platform":
+		// Static for the same reason: the platform's own version is what
+		// every declared command depends on, so it cannot be declared by one.
+		os.Exit(platform.Run(os.Args[2:]))
 	case "help", "--help", "-h":
 		usage()
 	default:
