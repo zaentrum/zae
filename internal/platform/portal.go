@@ -96,9 +96,15 @@ type Component struct {
 
 // Workload is one running Deployment as the cluster has it.
 type Workload struct {
-	Name              string `json:"name"`
-	Image             string `json:"image"`
-	DesiredReplicas   int    `json:"desiredReplicas"`
+	Name            string `json:"name"`
+	Image           string `json:"image"`
+	DesiredReplicas int    `json:"desiredReplicas"`
+	// Replicas is the TOTAL pods across every ReplicaSet — status.replicas,
+	// not the count asked for. It is a pointer because its absence is
+	// meaningful: zero is a real total for a stopped workload, while nothing
+	// at all means the instance does not report it, and zae then says its
+	// wait is weaker rather than quietly guessing.
+	Replicas          *int   `json:"replicas"`
 	ReadyReplicas     int    `json:"readyReplicas"`
 	UpdatedReplicas   int    `json:"updatedReplicas"`
 	AvailableReplicas int    `json:"availableReplicas"`
@@ -180,26 +186,57 @@ func (c *Console) managed() []Workload {
 	return out
 }
 
-// settled reports whether a workload has reached what was asked of it: the
-// cluster has acted on the spec it now has, every replica it asks for is a new
-// one, and every one of those is ready.
+// settled reports whether a workload has finished rolling out. It is the rule
+// `kubectl rollout status` uses, and pending() says which clause is open.
+func (w *Workload) settled() bool { return w.pendingFor(0) == "" }
+
+// pending is pendingFor with no particular generation in mind: has this
+// workload finished rolling out whatever it was last asked to?
+func (w *Workload) pending() string { return w.pendingFor(0) }
+
+// pending says what is still outstanding about this workload's rollout, or ""
+// when it is over. It is one function because the wait's verdict and the wait's
+// explanation must not be able to disagree.
 //
-// A workload scaled to zero is settled at zero: stopped is a state an admin
-// chose, not one to wait out. Ready and available are compared with >= rather
-// than == because a rollout that surges runs old and new pods together for a
-// moment, and a wait must not flap on that; updated is compared exactly,
-// since it never exceeds what was asked for.
-func (w *Workload) settled() bool {
-	if !w.observed(0) {
-		return false
+// Each clause earns its place, and the third one is the whole lesson:
+//
+//   - the cluster has acted on the spec this workload has;
+//   - updated == desired — every pod asked for has been created from the new
+//     revision;
+//   - TOTAL == updated — no pod from an older revision is left. With one
+//     replica the default strategy surges (maxSurge 1, maxUnavailable 0), so
+//     the new pod is created FIRST: throughout its startup updated is 1,
+//     ready is 1 and available is 1, every number the right size and every one
+//     of them counting the old pod beside a new one still in
+//     ContainerCreating. Only the total tells them apart — it is 2 until the
+//     old pod is gone;
+//   - available == updated — the new pods are past their readiness probe, not
+//     merely created. availableReplicas rather than readyReplicas: ready
+//     counts across every revision, so mid-surge it is describing the old pod.
+//
+// A workload scaled to zero settles at zero — every count is zero and the
+// arithmetic agrees, so stopped needs no special case.
+// gen, when non-zero, is the generation a particular write produced: the
+// stricter question, "has the cluster acted on MY change", which a listing
+// that lags behind the write cannot answer yes to.
+func (w *Workload) pendingFor(gen int64) string {
+	switch {
+	case !w.observed(gen):
+		return "the cluster has not acted on this change yet"
+	case w.UpdatedReplicas != w.DesiredReplicas:
+		return fmt.Sprintf("%d of %d pods created from the new revision", w.UpdatedReplicas, w.DesiredReplicas)
+	case w.Replicas != nil && *w.Replicas != w.UpdatedReplicas:
+		return fmt.Sprintf("%d pods running, %d from the new revision — the older ones are still there",
+			*w.Replicas, w.UpdatedReplicas)
+	case w.AvailableReplicas != w.UpdatedReplicas:
+		return fmt.Sprintf("%d of %d new pods available", w.AvailableReplicas, w.UpdatedReplicas)
+	case w.Phase == PhaseDegraded:
+		// A backstop, not a gate: the counters above cannot be satisfied by a
+		// workload whose pods are failing, so this can only catch a portal
+		// that knows something the arithmetic does not.
+		return "the platform reports it degraded"
 	}
-	if w.DesiredReplicas == 0 {
-		return w.Phase == PhaseStopped || w.ReadyReplicas == 0
-	}
-	return w.Phase == PhaseReady &&
-		w.UpdatedReplicas == w.DesiredReplicas &&
-		w.ReadyReplicas >= w.DesiredReplicas &&
-		w.AvailableReplicas >= w.DesiredReplicas
+	return ""
 }
 
 // observed reports whether the cluster has acted on generation gen, and on the
@@ -213,16 +250,42 @@ func (w *Workload) observed(gen int64) bool {
 	return w.Generation == 0 || w.ObservedGeneration >= w.Generation
 }
 
-// reportsRollout: this instance tells a client what a write produced, so a
-// wait can follow that rollout instead of whatever happens to be ready.
-func (w *Workload) reportsRollout() bool { return w != nil && w.Generation > 0 }
+// missingRollout names what these workloads do not report about their
+// rollouts. Empty when they report all of it — which is when, and only when, a
+// wait can be exact.
+func missingRollout(ws ...*Workload) []string {
+	var noGen, noTotal bool
+	for _, w := range ws {
+		if w == nil {
+			continue
+		}
+		noGen = noGen || w.Generation == 0
+		noTotal = noTotal || w.Replicas == nil
+	}
+	var missing []string
+	if noGen {
+		missing = append(missing, "rollout generation")
+	}
+	if noTotal {
+		missing = append(missing, "total replica count")
+	}
+	return missing
+}
 
 // state is one workload on one line: how many of its replicas are up, its
-// phase, and the cluster's reason when it has one.
-func (w *Workload) state() string {
+// phase, the cluster's reason when it has one, and what its rollout is still
+// waiting for. It is what a wait prints as progress and what it prints when it
+// runs out of time, so it has to carry the same verdict either way.
+func (w *Workload) state() string { return w.stateFor(0) }
+
+// stateFor is state judged against the generation a particular write produced.
+func (w *Workload) stateFor(gen int64) string {
 	s := fmt.Sprintf("%s %d/%d %s", w.Name, w.ReadyReplicas, w.DesiredReplicas, w.Phase)
 	if w.Reason != "" {
 		s += ": " + w.Reason
+	}
+	if p := w.pendingFor(gen); p != "" {
+		s += " · " + p
 	}
 	return s
 }

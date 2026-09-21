@@ -77,12 +77,14 @@ every workload the operator manages is ready.
 restart and scale act on one workload. The platform protects its stateful
 services and refuses those itself, in its own words.
 
---wait follows the rollout THIS command produced: the platform answers a write
-with the generation it made, and zae waits until the cluster has acted on that
-generation. It is not the next moment everything reports ready — for the first
-seconds of a rollout the replica counters describe the pods from before it.
-Against an instance whose portal-api predates that answer, zae says so and
-falls back to a readiness gate.
+--wait follows the rollout THIS command produced, by the rule kubectl rollout
+status uses: the cluster has acted on the generation the write returned, every
+pod asked for comes from the new revision, NO pod from an older one is left,
+and all of them are available. The third clause is the one that matters — a
+one-replica rollout creates the new pod before retiring the old one, and until
+it does the counters describe the old pod at exactly the size asked for.
+Against an instance whose portal-api reports less than that, zae names what it
+cannot see and falls back to a readiness gate.
 
 This does not update the operator's own controller image: the controller runs
 outside the namespace the portal administers. Apply its install bundle for
@@ -378,8 +380,18 @@ func update(args []string) int {
 		waitingFor = fmt.Sprintf("the platform to report %s, and every workload the operator manages to be ready", target)
 		settled = fmt.Sprintf("the platform reports %s, and every workload the operator manages is ready", target)
 	}
-	exact := done.Generation > 0 && op.Generation > 0
-	return follow(ctx, c, waitingFor, settled, *timeout, exact, platformSettled(target, done.Generation))
+	// What this instance cannot tell zae about the rollout it just asked for:
+	// the operator's own generation, and whatever its workloads leave out.
+	managed := cons.managed()
+	ptrs := make([]*Workload, 0, len(managed))
+	for i := range managed {
+		ptrs = append(ptrs, &managed[i])
+	}
+	missing := missingRollout(ptrs...)
+	if (done.Generation == 0 || op.Generation == 0) && !contains(missing, "rollout generation") {
+		missing = append([]string{"rollout generation"}, missing...)
+	}
+	return follow(ctx, c, waitingFor, settled, *timeout, missing, platformSettled(target, done.Generation))
 }
 
 // restart rolls one workload.
@@ -432,7 +444,7 @@ func restart(args []string) int {
 		return exitcode.OK
 	}
 	r := rolloutOf(done, w)
-	return follow(ctx, c, name+" to be ready again", name+" is ready", *timeout, r.exact, workloadSettled(name, -1, r))
+	return follow(ctx, c, name+" to be ready again", name+" is ready", *timeout, r.missing, workloadSettled(name, -1, r))
 }
 
 // scale sets one workload's replica count.
@@ -493,7 +505,7 @@ func scale(args []string) int {
 	}
 	r := rolloutOf(done, w)
 	return follow(ctx, c, fmt.Sprintf("%s to run %d", name, n), fmt.Sprintf("%s runs %d", name, n),
-		*timeout, r.exact, workloadSettled(name, n, r))
+		*timeout, r.missing, workloadSettled(name, n, r))
 }
 
 // askFirst asks before a change, unless --yes was given or the platform

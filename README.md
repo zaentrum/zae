@@ -218,16 +218,20 @@ the platform reports 1.5.0, and every workload the operator manages is ready
 - **Asking.** `update`, `restart` and `scale` print what will change and ask on
   stdin. Without a terminal there they need `--yes`, and exit `2` before
   anything is written.
-- **Waiting follows *this* rollout.** Every write answers with the generation
-  it produced, and `--wait` waits until the cluster has acted on exactly that
-  one — then until the platform reports the new version and every workload the
-  operator manages is rolled out and ready. It prints a line per change of
-  state and exits `1` on `--timeout` (default `10m`) naming what was still not
-  ready. The distinction is not academic: for the first seconds of a rollout
-  the replica counters describe the pods from *before* the write, all of them
-  ready, and a wait that believes them reports success before anything has
-  happened. Against a portal-api that predates the generation in its answer,
-  zae says so in one line and falls back to that weaker readiness gate.
+- **Waiting follows *this* rollout,** by the rule `kubectl rollout status`
+  uses: the cluster has acted on the generation the write returned, every pod
+  asked for comes from the new revision, **no pod from an older revision is
+  left**, and all of them are available. It prints a line per change of state
+  and exits `1` on `--timeout` (default `10m`) naming what was still not ready.
+
+  Every clause is there because a weaker one was wrong. A one-replica rollout
+  surges — `maxSurge 1`, `maxUnavailable 0` — so the new pod is created *first*,
+  and for the whole of its startup the cluster reports `updatedReplicas 1`,
+  `readyReplicas 1`, `availableReplicas 1`: every number the size asked for,
+  every one of them counting the pod from *before* the restart. Only the total
+  pod count separates them — `2` during the surge, `1` once the old pod is
+  gone. Against a portal-api that reports less than this, zae names the field
+  it cannot see and falls back to the weaker readiness gate.
 - Exit codes follow the contract below: `3` means this instance has no
   operator console — it is not running where it can manage workloads, or it
   has no operator resource — or that no workload has that name.

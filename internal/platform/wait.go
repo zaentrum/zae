@@ -16,11 +16,15 @@ import (
 // than the progress was.
 type settle func(*Console) (done bool, state string)
 
-// readinessOnly is what zae says when the instance cannot tell it what a write
-// produced. It is printed once, before such a wait, because the difference
-// matters: this wait can be satisfied by pods that were already ready.
-const readinessOnly = "note: this instance reports no rollout generation, so this wait is a readiness gate — " +
-	"it can be satisfied by the pods that were already running. Its portal-api predates the exact wait."
+// readinessNote is what zae says when the instance does not report everything
+// a rollout is judged by. It is printed once, before such a wait, and it names
+// what is missing: a wait that quietly gets weaker is how a restart came to
+// report success eight seconds before its pod existed.
+func readinessNote(missing []string) string {
+	return "note: this instance reports no " + strings.Join(missing, " and no ") +
+		", so this wait is a readiness gate — it can be satisfied by the pods that were already running. " +
+		"Its portal-api predates the exact wait."
+}
 
 // poll reads the console until check accepts it or timeout passes, printing
 // the state only when it changes. A portal failing for a moment is asked
@@ -74,12 +78,13 @@ func sleep(ctx context.Context, d time.Duration) bool {
 
 // follow runs one wait and maps its outcome onto the exit codes: 0 when it
 // settled, 1 when it did not, and the call's own code when the portal stopped
-// answering for a reason waiting cannot fix. exact says the instance told zae
-// what the write produced; when it did not, zae says so and falls back to the
-// readiness gate it had before.
-func follow(ctx context.Context, c *client, waitingFor, settledMsg string, timeout time.Duration, exact bool, check settle) int {
+// answering for a reason waiting cannot fix. missing names what the instance
+// does not report about rollouts; when it is empty the wait is exact, and when
+// it is not zae says so and falls back to the readiness gate it had before.
+func follow(ctx context.Context, c *client, waitingFor, settledMsg string, timeout time.Duration, missing []string, check settle) int {
+	exact := len(missing) == 0
 	if !exact {
-		fmt.Fprintln(stdout, readinessOnly)
+		fmt.Fprintln(stdout, readinessNote(missing))
 	}
 	fmt.Fprintf(stdout, "waiting for %s (timeout %s)\n", waitingFor, timeout)
 	done, state, err := c.poll(ctx, timeout, !exact, check)
@@ -149,19 +154,32 @@ type rollout struct {
 	// was already there — two restarts in one second change nothing, exactly
 	// as kubectl's do, and a wait must not sit there expecting otherwise.
 	stamp, before string
-	// exact: the instance reports rollout generations, so the wait follows
-	// this write rather than whatever happens to be ready.
-	exact bool
+	// missing names what the instance does not report about rollouts, so the
+	// wait can say what it cannot see. Empty when it is exact.
+	missing []string
 }
 
 // rolloutOf reads a write's answer against the workload as it was before.
 func rolloutOf(w write, before *Workload) rollout {
-	r := rollout{generation: w.Generation, before: before.RestartedAt,
-		exact: w.Generation > 0 && before.reportsRollout()}
+	r := rollout{generation: w.Generation, before: before.RestartedAt, missing: missingRollout(before)}
+	if w.Generation == 0 && !contains(r.missing, "rollout generation") {
+		// The console reports generations and the write did not: an instance
+		// mid-upgrade, or one behind a proxy that swallowed the body.
+		r.missing = append([]string{"rollout generation"}, r.missing...)
+	}
 	if w.RestartedAt != "" && w.RestartedAt != before.RestartedAt {
 		r.stamp = w.RestartedAt
 	}
 	return r
+}
+
+func contains(ss []string, s string) bool {
+	for _, x := range ss {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }
 
 // workloadSettled waits for one workload. want is the replica count a scale
@@ -175,20 +193,18 @@ func workloadSettled(name string, want int, r rollout) settle {
 		case w == nil:
 			return false, name + " is no longer among the instance's workloads"
 		case want >= 0 && w.DesiredReplicas != want:
-			return false, fmt.Sprintf("%s — the platform still asks for %d", w.state(), w.DesiredReplicas)
-		case !w.observed(r.generation):
-			// The rollout zae asked for has not started. This is the window in
-			// which everything else below would say yes about the old pods.
-			return false, w.state() + " — the rollout has not started yet"
+			return false, fmt.Sprintf("%s · the platform still asks for %d", w.stateFor(r.generation), w.DesiredReplicas)
 		case r.stamp != "" && w.RestartedAt == r.before:
 			// The stamp has not moved, so these are still the pods from before
 			// the restart — however ready they say they are. A later restart by
 			// somebody else moves it too, and supersedes this one: waiting for
 			// THEIR rollout is right, waiting for a stamp that will never come
 			// back is not.
-			return false, w.state() + " — still running the rollout from before this restart"
+			return false, w.stateFor(r.generation) + " · still running the rollout from before this restart"
 		}
-		return w.settled(), w.state()
+		// pendingFor judges against the generation THIS write produced, so a
+		// listing that has not caught up cannot answer yes for the old pods.
+		return w.pendingFor(r.generation) == "", w.stateFor(r.generation)
 	}
 }
 

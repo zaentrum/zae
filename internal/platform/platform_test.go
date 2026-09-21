@@ -41,6 +41,8 @@ type fakePortal struct {
 	// 204 with nothing, and the console reports no generations. zae has to
 	// keep working against it, and has to say that its wait is weaker.
 	legacy bool
+	// noTotal is the half-way portal: generations, but no total pod count.
+	noTotal bool
 	// stamps counts the restart stamps written, so each is a new one.
 	stamps int
 
@@ -88,24 +90,27 @@ func newPortal(t *testing.T) (*fakePortal, *httptest.Server) {
 // name, with nothing grouped. Grouping them is zae's job.
 func exampleWorkloads() []Workload {
 	return []Workload{
-		{Name: "chino-api", Image: "ghcr.io/example/chino-api:1.4.0", DesiredReplicas: 2, ReadyReplicas: 2,
-			UpdatedReplicas: 2, AvailableReplicas: 2, Phase: PhaseReady, OperatorManaged: true, Group: GroupPlatform,
+		{Name: "chino-api", Image: "ghcr.io/example/chino-api:1.4.0", DesiredReplicas: 2, Replicas: pods(2),
+			ReadyReplicas: 2, UpdatedReplicas: 2, AvailableReplicas: 2, Phase: PhaseReady,
+			OperatorManaged: true, Group: GroupPlatform,
 			Generation: 3, ObservedGeneration: 3, RestartedAt: "2026-09-20T08:00:00Z"},
-		{Name: "example-worker", Image: "ghcr.io/example/worker:2.0.0", DesiredReplicas: 1, ReadyReplicas: 1,
-			UpdatedReplicas: 1, AvailableReplicas: 1, Phase: PhaseReady, Group: GroupAddon, Addon: "example",
-			Generation: 1, ObservedGeneration: 1},
+		{Name: "example-worker", Image: "ghcr.io/example/worker:2.0.0", DesiredReplicas: 1, Replicas: pods(1),
+			ReadyReplicas: 1, UpdatedReplicas: 1, AvailableReplicas: 1, Phase: PhaseReady,
+			Group: GroupAddon, Addon: "example", Generation: 1, ObservedGeneration: 1},
 		{Name: "katalog-api", Image: "ghcr.io/example/katalog-api@sha256:" + strings.Repeat("a", 64),
-			DesiredReplicas: 1, ReadyReplicas: 0, UpdatedReplicas: 1, Phase: PhaseDegraded,
+			DesiredReplicas: 1, Replicas: pods(1), ReadyReplicas: 0, UpdatedReplicas: 1, Phase: PhaseDegraded,
 			OperatorManaged: true, Group: GroupPlatform, Reason: "ImagePullBackOff",
 			Generation: 2, ObservedGeneration: 2},
-		{Name: "leftover", Image: "ghcr.io/example/leftover", DesiredReplicas: 1, ReadyReplicas: 1,
-			UpdatedReplicas: 1, AvailableReplicas: 1, Phase: PhaseReady, Group: GroupOther,
+		{Name: "leftover", Image: "ghcr.io/example/leftover", DesiredReplicas: 1, Replicas: pods(1),
+			ReadyReplicas: 1, UpdatedReplicas: 1, AvailableReplicas: 1, Phase: PhaseReady, Group: GroupOther,
 			Generation: 1, ObservedGeneration: 1},
-		{Name: "postgres", Image: "postgres:16", DesiredReplicas: 1, ReadyReplicas: 1, UpdatedReplicas: 1,
-			AvailableReplicas: 1, Phase: PhaseReady, OperatorManaged: true, Group: GroupPlatform, Protected: true,
-			Generation: 1, ObservedGeneration: 1},
+		{Name: "postgres", Image: "postgres:16", DesiredReplicas: 1, Replicas: pods(1), ReadyReplicas: 1,
+			UpdatedReplicas: 1, AvailableReplicas: 1, Phase: PhaseReady, OperatorManaged: true,
+			Group: GroupPlatform, Protected: true, Generation: 1, ObservedGeneration: 1},
 	}
 }
+
+func pods(n int) *int { return &n }
 
 func (p *fakePortal) get(w http.ResponseWriter, r *http.Request) {
 	p.reads++
@@ -143,9 +148,15 @@ func (p *fakePortal) strip(v any) map[string]any {
 	var m map[string]any
 	_ = json.Unmarshal(raw, &m)
 	if p.legacy {
-		for _, k := range []string{"generation", "observedGeneration", "restartedAt"} {
+		for _, k := range []string{"generation", "observedGeneration", "restartedAt", "replicas"} {
 			delete(m, k)
 		}
+	}
+	if p.noTotal {
+		// The portal that reports generations but not the total pod count:
+		// the one zae itself shipped first, and the one the live restart was
+		// still declared finished against.
+		delete(m, "replicas")
 	}
 	return m
 }
@@ -232,6 +243,7 @@ func (p *fakePortal) scale(w http.ResponseWriter, r *http.Request) {
 	case body.Replicas < 0 || body.Replicas > 20:
 		http.Error(w, "replicas must be between 0 and 20", http.StatusBadRequest)
 	default:
+		// The count asked for moves; the pods do not, yet.
 		wl.DesiredReplicas = body.Replicas
 		wl.Phase = PhaseProgressing
 		wl.Generation++
@@ -294,11 +306,23 @@ func (p *fakePortal) readyCounters() {
 	for i := range p.workloads {
 		w := &p.workloads[i]
 		w.ReadyReplicas, w.UpdatedReplicas, w.AvailableReplicas = w.DesiredReplicas, w.DesiredReplicas, w.DesiredReplicas
+		w.Replicas = pods(w.DesiredReplicas)
 		w.Phase, w.Reason = PhaseReady, ""
 		if w.DesiredReplicas == 0 {
 			w.Phase = PhaseStopped
 		}
 	}
+}
+
+// surge is the live failure, reproduced: the rollout has created the new pod
+// and the old one is still serving, so the TOTAL is one more than was asked
+// for while every other counter reads exactly right.
+func (p *fakePortal) surge(name string) {
+	w := p.workload(name)
+	w.ObservedGeneration = w.Generation
+	w.Replicas = pods(w.DesiredReplicas + 1)
+	w.UpdatedReplicas, w.ReadyReplicas, w.AvailableReplicas = w.DesiredReplicas, w.DesiredReplicas, w.DesiredReplicas
+	w.Phase, w.Reason = PhaseReady, ""
 }
 
 func (p *fakePortal) called(key string) int {
@@ -816,7 +840,7 @@ func TestScaleWaitsForTheReplicaCount(t *testing.T) {
 	if code != exitcode.OK || !strings.Contains(out, "chino-api is ready") {
 		t.Fatalf("restart --wait: want 0, got %d\n%s\n%s", code, out, errs)
 	}
-	if !strings.Contains(out, "the rollout has not started yet") {
+	if !strings.Contains(out, "the cluster has not acted on this change yet") {
 		t.Errorf("the wait must show the rollout it waited through:\n%s", out)
 	}
 }
@@ -841,7 +865,7 @@ func TestRestartWaitsForTheNewRolloutAndNotForTheOldPods(t *testing.T) {
 	if code != exitcode.OK {
 		t.Fatalf("want 0, got %d\n%s\n%s", code, out, errs)
 	}
-	if !strings.Contains(out, "the rollout has not started yet") {
+	if !strings.Contains(out, "the cluster has not acted on this change yet") {
 		t.Fatalf("the wait must refuse the pods from before the restart:\n%s", out)
 	}
 	if done == 0 || p.reads < done {
@@ -854,6 +878,97 @@ func TestRestartWaitsForTheNewRolloutAndNotForTheOldPods(t *testing.T) {
 	// Nothing about a readiness-gate-only wait is said, because this one is not.
 	if strings.Contains(out, "readiness gate") {
 		t.Errorf("an exact wait must not warn about a weaker one:\n%s", out)
+	}
+}
+
+// The live sequence, exactly as it was measured on the demo: one replica, so
+// the rollout surges — the new pod is created first, and while it starts up
+// the cluster reports updated 1, ready 1, available 1 and observedGeneration
+// caught up. Every one of those is the right number about the wrong pod. Only
+// the total says so: 2 during the surge, 1 when the old pod is gone.
+func TestRestartDoesNotFinishWhileTheOldPodIsStillThere(t *testing.T) {
+	p, srv := newPortal(t)
+	surging, finished := 0, 0
+	p.onWrite = func(p *fakePortal) { surging = p.reads }
+	p.onGet = func(p *fakePortal, n int) {
+		switch {
+		case surging == 0:
+		case n >= surging+5:
+			// The old pod is gone: one pod, from the new revision, available.
+			finished = n
+			p.ready()
+		default:
+			p.surge("chino-api")
+		}
+	}
+	code, out, errs := run(t, "", false, "restart", "chino-api", "--url", srv.URL, "--yes", "--wait", "--timeout", "10s")
+	if code != exitcode.OK {
+		t.Fatalf("want 0, got %d\n%s\n%s", code, out, errs)
+	}
+	if finished == 0 || p.reads < finished {
+		t.Fatalf("the wait ended during the surge (reads=%d, old pod gone at %d)\n%s", p.reads, finished, out)
+	}
+	if !strings.Contains(out, "the older ones are still there") {
+		t.Fatalf("the wait must say what it is waiting for:\n%s", out)
+	}
+	// And it must have taken more than one look: a gate that passed on the
+	// first reading is the bug, whatever it printed afterwards.
+	if lines := strings.Count(out, "\n  "); lines < 2 {
+		t.Errorf("the wait went through one state only:\n%s", out)
+	}
+}
+
+// Ready and updated at the size asked for, with an old pod still running, is
+// the exact state that used to pass. It must not, and it must be told apart
+// from the states that legitimately do.
+func TestSettledRules(t *testing.T) {
+	base := func() Workload {
+		return Workload{Name: "w", DesiredReplicas: 1, Replicas: pods(1), UpdatedReplicas: 1,
+			ReadyReplicas: 1, AvailableReplicas: 1, Phase: PhaseReady, Generation: 5, ObservedGeneration: 5}
+	}
+	with := func(f func(*Workload)) Workload { w := base(); f(&w); return w }
+	for name, tc := range map[string]struct {
+		w    Workload
+		want bool
+	}{
+		"rolled out":              {base(), true},
+		"mid-surge, old pod left": {with(func(w *Workload) { w.Replicas = pods(2) }), false},
+		"new pod not created yet": {with(func(w *Workload) { w.UpdatedReplicas, w.Replicas = 0, pods(1) }), false},
+		"new pod not available":   {with(func(w *Workload) { w.AvailableReplicas = 0 }), false},
+		"spec not acted on":       {with(func(w *Workload) { w.ObservedGeneration = 4 }), false},
+		"stopped at zero":         {Workload{Name: "w", Replicas: pods(0), Phase: PhaseStopped, Generation: 2, ObservedGeneration: 2}, true},
+		// Without the total, the same surge cannot be seen — which is why zae
+		// says so rather than calling that wait exact.
+		"surge is invisible without the total": {with(func(w *Workload) { w.Replicas = nil }), true},
+		"degraded is never settled":            {with(func(w *Workload) { w.Phase = PhaseDegraded }), false},
+	} {
+		if got := tc.w.settled(); got != tc.want {
+			t.Errorf("%s: settled() = %v, want %v (%s)", name, got, tc.want, tc.w.pending())
+		}
+	}
+}
+
+// A portal that reports generations but not the total pod count — the one zae
+// shipped first — still works, and says which half it is missing.
+func TestWaitNamesTheTotalItCannotSee(t *testing.T) {
+	p, srv := newPortal(t)
+	p.noTotal = true
+	restarted := 0
+	p.onWrite = func(p *fakePortal) { restarted = p.reads }
+	p.onGet = func(p *fakePortal, n int) {
+		if restarted > 0 && n > restarted+1 {
+			p.ready()
+		}
+	}
+	code, out, errs := run(t, "", false, "restart", "chino-api", "--url", srv.URL, "--yes", "--wait", "--timeout", "10s")
+	if code != exitcode.OK {
+		t.Fatalf("want 0, got %d\n%s\n%s", code, out, errs)
+	}
+	if !strings.Contains(out, "no total replica count") || !strings.Contains(out, "readiness gate") {
+		t.Fatalf("the note must name the field it cannot see:\n%s", out)
+	}
+	if strings.Contains(out, "no rollout generation") {
+		t.Errorf("this portal does report generations:\n%s", out)
 	}
 }
 
