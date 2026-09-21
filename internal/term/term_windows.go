@@ -1,4 +1,7 @@
-package addon
+// Package term answers the two questions every command that asks a person
+// something has to answer: is there a person on the other end of stdin, and
+// can this terminal be told to stop echoing while a secret is typed.
+package term
 
 import (
 	"os"
@@ -10,14 +13,14 @@ const enableEchoInput = 0x0004
 
 var setConsoleMode = syscall.NewLazyDLL("kernel32.dll").NewProc("SetConsoleMode")
 
-// terminal reports whether f is a console: only a console has a console mode.
-func terminal(f *os.File) bool {
+// Is reports whether f is a console: only a console has a console mode.
+func Is(f *os.File) bool {
 	var mode uint32
 	return syscall.GetConsoleMode(syscall.Handle(f.Fd()), &mode) == nil
 }
 
-// withoutEcho turns off echo on the console f and returns what turns it back on.
-func withoutEcho(f *os.File) (func(), error) {
+// WithoutEcho turns off echo on the console f and returns what turns it back on.
+func WithoutEcho(f *os.File) (func(), error) {
 	h := syscall.Handle(f.Fd())
 	var mode uint32
 	if err := syscall.GetConsoleMode(h, &mode); err != nil {
