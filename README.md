@@ -185,7 +185,7 @@ https://media.example.org — the platform
   rolls        3 workloads the operator manages
 apply this to https://media.example.org? [y/N] y
 waiting for the platform to report 1.5.0, and every workload the operator manages to be ready (timeout 10m)
-  Reconciling  1.4.0 · 2/3 ready — waiting for 1.5.0; katalog-api 0/1 degraded: ImagePullBackOff
+  Reconciling  1.4.0 · 2/3 ready — the operator has not reconciled this change yet (at 7, waiting for 8); waiting for 1.5.0
   Reconciling  1.5.0 · 2/3 ready — katalog-api 0/1 progressing
   Ready        1.5.0 · 3/3 ready
 the platform reports 1.5.0, and every workload the operator manages is ready
@@ -204,23 +204,30 @@ the platform reports 1.5.0, and every workload the operator manages is ready
   Update it by applying its install bundle — or through OLM, where the cluster
   installs it that way. `zae platform` updates the platform that controller
   deploys, which is the other half.
-- **`--apply` takes no version of its own.** It pins the platform to what the
-  operator discovered, so `--apply --version V` is a usage error (`2`), and so
-  is `--apply --channel C`: the update on the shelf is the one found on the
-  channel being followed *now*. Change the channel, let the operator look,
-  then apply.
+- **`--apply` takes no version of its own — and names the one it read.** It
+  pins the platform to what the operator discovered, so `--apply --version V`
+  is a usage error (`2`), and so is `--apply --channel C`: the update on the
+  shelf is the one found on the channel being followed *now*. Change the
+  channel, let the operator look, then apply. The request carries the version
+  zae showed you, so if the operator discovered another one in between — a
+  newer release, somebody else's channel change — the platform refuses it
+  (exit `1`) instead of rolling to a version nobody chose.
 - **Protected workloads are refused by the platform,** in its words — the
   stateful services it keeps out of reach. zae prints that reason and exits
   `1`; it does not keep a copy of the rule.
 - **Asking.** `update`, `restart` and `scale` print what will change and ask on
   stdin. Without a terminal there they need `--yes`, and exit `2` before
   anything is written.
-- **Waiting.** `--wait` follows the rollout until the platform reports the new
-  version *and* every workload the operator manages is ready, printing a line
-  per change of state, and exits `1` on `--timeout` (default `10m`) naming
-  what was still not ready. A `--wait` after `restart` is a readiness gate,
-  not proof that the new pods are the ones running: the console reports no
-  rollout revision, so zae waits one interval and then watches the counters.
+- **Waiting follows *this* rollout.** Every write answers with the generation
+  it produced, and `--wait` waits until the cluster has acted on exactly that
+  one — then until the platform reports the new version and every workload the
+  operator manages is rolled out and ready. It prints a line per change of
+  state and exits `1` on `--timeout` (default `10m`) naming what was still not
+  ready. The distinction is not academic: for the first seconds of a rollout
+  the replica counters describe the pods from *before* the write, all of them
+  ready, and a wait that believes them reports success before anything has
+  happened. Against a portal-api that predates the generation in its answer,
+  zae says so in one line and falls back to that weaker readiness gate.
 - Exit codes follow the contract below: `3` means this instance has no
   operator console — it is not running where it can manage workloads, or it
   has no operator resource — or that no workload has that name.
@@ -337,7 +344,7 @@ still wins, for service accounts and CI.
 | Instance-side capability discovery (`/api/portal/cli/discovery`) | ✅ served by portal-api; acquire is the first service declaring itself (10 commands) |
 | Running discovered commands, with the exit-code contract and `zae require` | ✅ v0.2 |
 | `zae addon add/list/status/upgrade/remove` (charts installed by the operator) | 🔶 built against the addon chart API; needs an instance whose portal-api and operator ship it |
-| `zae platform status/update/restart/scale` (the operator console) | 🔶 built against the portal's operator console; needs an operator-managed instance. The operator's own controller image is out of scope — that is its install bundle |
+| `zae platform status/update/restart/scale` (the operator console) | 🔶 built against the portal's operator console; needs an operator-managed instance — an older portal-api works, with a weaker `--wait` that says so. The operator's own controller image is out of scope — that is its install bundle |
 | `zae login` / `logout` / `whoami` (device grant with PKCE, refresh, per-instance sessions) | 🔶 built; needs a portal-api that advertises `auth` and an operator-created public client |
 | Registered checks, `events tail`, journey smoke tests, `addon lint` | 🧭 next — discovery and login are in place |
 

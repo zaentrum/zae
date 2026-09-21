@@ -77,6 +77,12 @@ type Operator struct {
 	CurrentVersion  string      `json:"currentVersion"`
 	AvailableUpdate string      `json:"availableUpdate"`
 	Components      []Component `json:"components"`
+	// Generation and ObservedGeneration are the spec generation of the
+	// operator's resource and the one its status was written for. A wait uses
+	// them to follow the write it made rather than whatever is Ready. Both are
+	// 0 against a portal that predates them.
+	Generation         int64 `json:"generation"`
+	ObservedGeneration int64 `json:"observedGeneration"`
 	// Note says why there is nothing to report, when Present is false.
 	Note string `json:"note"`
 }
@@ -109,6 +115,31 @@ type Workload struct {
 	AlwaysPull bool   `json:"alwaysPull"`
 	Addon      string `json:"addon,omitempty"`
 	Component  string `json:"component,omitempty"`
+	// Generation, ObservedGeneration and RestartedAt are what make a wait
+	// exact. The replica counters cannot do it: for the first seconds of a
+	// rollout they describe the pods from BEFORE the write — every field true,
+	// the conclusion false — which is how a restart once reported ready eight
+	// seconds after it was asked for. All three are 0/"" against a portal that
+	// predates them, and zae then says its wait is a readiness gate only.
+	Generation         int64  `json:"generation"`
+	ObservedGeneration int64  `json:"observedGeneration"`
+	RestartedAt        string `json:"restartedAt"`
+}
+
+// write answers POST …/instances/{name}/{scale,restart}: the generation the
+// write produced, and the rollout stamp a restart wrote. An older portal
+// answers 204 and nothing, which leaves both zero.
+type write struct {
+	Name        string `json:"name"`
+	Generation  int64  `json:"generation"`
+	RestartedAt string `json:"restartedAt"`
+}
+
+// updated answers PATCH /operator and POST /operator/apply-update: the version
+// the platform now asks for and the generation that write made.
+type updated struct {
+	Version    string `json:"version"`
+	Generation int64  `json:"generation"`
 }
 
 // offered reports whether this instance has an operator console to drive.
@@ -149,15 +180,42 @@ func (c *Console) managed() []Workload {
 	return out
 }
 
-// settled reports whether a workload has reached what was asked of it. A
-// workload scaled to zero is settled at zero: stopped is a state an admin
-// chose, not one to wait out.
+// settled reports whether a workload has reached what was asked of it: the
+// cluster has acted on the spec it now has, every replica it asks for is a new
+// one, and every one of those is ready.
+//
+// A workload scaled to zero is settled at zero: stopped is a state an admin
+// chose, not one to wait out. Ready and available are compared with >= rather
+// than == because a rollout that surges runs old and new pods together for a
+// moment, and a wait must not flap on that; updated is compared exactly,
+// since it never exceeds what was asked for.
 func (w *Workload) settled() bool {
+	if !w.observed(0) {
+		return false
+	}
 	if w.DesiredReplicas == 0 {
 		return w.Phase == PhaseStopped || w.ReadyReplicas == 0
 	}
-	return w.Phase == PhaseReady && w.ReadyReplicas >= w.DesiredReplicas && w.UpdatedReplicas >= w.DesiredReplicas
+	return w.Phase == PhaseReady &&
+		w.UpdatedReplicas == w.DesiredReplicas &&
+		w.ReadyReplicas >= w.DesiredReplicas &&
+		w.AvailableReplicas >= w.DesiredReplicas
 }
+
+// observed reports whether the cluster has acted on generation gen, and on the
+// spec this workload now has. A portal that reports no generations says 0, and
+// the test passes — that instance's waits are readiness gates, which zae says
+// out loud rather than pretending otherwise.
+func (w *Workload) observed(gen int64) bool {
+	if gen > w.ObservedGeneration {
+		return false
+	}
+	return w.Generation == 0 || w.ObservedGeneration >= w.Generation
+}
+
+// reportsRollout: this instance tells a client what a write produced, so a
+// wait can follow that rollout instead of whatever happens to be ready.
+func (w *Workload) reportsRollout() bool { return w != nil && w.Generation > 0 }
 
 // state is one workload on one line: how many of its replicas are up, its
 // phase, and the cluster's reason when it has one.
@@ -259,6 +317,12 @@ func (c *client) do(ctx context.Context, what, method, path string, in, out any)
 		}
 		return &apiError{code: exitcode.NotOffered, status: s,
 			msg: fmt.Sprintf("not offered: %s: %s answered 404: %s", what, c.base, excerpt(raw))}
+	case s == http.StatusConflict:
+		// The platform refused because what zae asked for is no longer what it
+		// read: the update on the shelf changed while the question was being
+		// answered. Looking again is the whole fix, so say that.
+		return &apiError{code: exitcode.Failed, status: s,
+			msg: fmt.Sprintf("failed: %s: %s — look again with: zae platform status --url %s", what, excerpt(raw), c.base)}
 	case s == http.StatusServiceUnavailable:
 		// The portal says this in exactly one case: it is not running where it
 		// could manage anything. That is definitive, and no wait changes it.

@@ -77,6 +77,13 @@ every workload the operator manages is ready.
 restart and scale act on one workload. The platform protects its stateful
 services and refuses those itself, in its own words.
 
+--wait follows the rollout THIS command produced: the platform answers a write
+with the generation it made, and zae waits until the cluster has acted on that
+generation. It is not the next moment everything reports ready — for the first
+seconds of a rollout the replica counters describe the pods from before it.
+Against an instance whose portal-api predates that answer, zae says so and
+falls back to a readiness gate.
+
 This does not update the operator's own controller image: the controller runs
 outside the namespace the portal administers. Apply its install bundle for
 that — or use OLM, where the cluster installs it that way.
@@ -276,6 +283,10 @@ func update(args []string) int {
 	case *apply && set["version"]:
 		return usageErr("--apply pins the update the operator discovered, and --version pins the one you name — use one of them")
 	case *apply && set["channel"]:
+		// zae sends the update it read as the one it means, and the platform
+		// refuses a different one — so this combination could only ever end in
+		// that refusal, or in applying the old channel's update by accident.
+		// Refusing it here says which two commands to run instead.
 		return usageErr("--apply applies the update discovered on the channel the platform follows now, which is not the one --channel asks for — run zae platform update --channel %s first, then --apply once the operator has looked", strings.TrimSpace(*channel))
 	case set["mode"] && *mode != "auto" && *mode != "manual":
 		return usageErr("--mode is auto or manual, not %q", *mode)
@@ -339,13 +350,21 @@ func update(args []string) int {
 		return exitcode.Failed
 	}
 
+	// done carries the generation the write produced, so the wait follows this
+	// change and not merely the next moment everything reports Ready.
+	var done updated
 	if len(body) > 0 {
-		if err := c.do(ctx, "change the platform", http.MethodPatch, operatorPath, body, nil); err != nil {
+		if err := c.do(ctx, "change the platform", http.MethodPatch, operatorPath, body, &done); err != nil {
 			return fail(err)
 		}
 	}
 	if *apply {
-		if err := c.do(ctx, "apply the update", http.MethodPost, applyPath, nil, nil); err != nil {
+		// Name the update that was decided on: if the operator has discovered
+		// another one since — a channel changed underneath, a newer release
+		// landed — the platform refuses rather than rolling to a version
+		// nobody chose. An older portal ignores the field.
+		if err := c.do(ctx, "apply the update", http.MethodPost, applyPath,
+			map[string]any{"version": strings.TrimSpace(op.AvailableUpdate)}, &done); err != nil {
 			return fail(err)
 		}
 	}
@@ -359,7 +378,8 @@ func update(args []string) int {
 		waitingFor = fmt.Sprintf("the platform to report %s, and every workload the operator manages to be ready", target)
 		settled = fmt.Sprintf("the platform reports %s, and every workload the operator manages is ready", target)
 	}
-	return follow(ctx, c, waitingFor, settled, *timeout, false, platformSettled(target))
+	exact := done.Generation > 0 && op.Generation > 0
+	return follow(ctx, c, waitingFor, settled, *timeout, exact, platformSettled(target, done.Generation))
 }
 
 // restart rolls one workload.
@@ -403,14 +423,16 @@ func restart(args []string) int {
 		fmt.Fprintln(stdout, "nothing restarted")
 		return exitcode.Failed
 	}
-	if err := c.do(ctx, "restart "+name, http.MethodPost, instancePath(name, "restart"), nil, nil); err != nil {
+	var done write
+	if err := c.do(ctx, "restart "+name, http.MethodPost, instancePath(name, "restart"), nil, &done); err != nil {
 		return fail(err)
 	}
 	if !*wait {
 		fmt.Fprintf(stdout, "restarting %s — follow it with zae platform status --url %s\n", name, base)
 		return exitcode.OK
 	}
-	return follow(ctx, c, name+" to be ready again", name+" is ready", *timeout, true, workloadSettled(name, -1))
+	r := rolloutOf(done, w)
+	return follow(ctx, c, name+" to be ready again", name+" is ready", *timeout, r.exact, workloadSettled(name, -1, r))
 }
 
 // scale sets one workload's replica count.
@@ -461,15 +483,17 @@ func scale(args []string) int {
 		return exitcode.Failed
 	}
 	what := fmt.Sprintf("scale %s to %d", name, n)
-	if err := c.do(ctx, what, http.MethodPost, instancePath(name, "scale"), map[string]any{"replicas": n}, nil); err != nil {
+	var done write
+	if err := c.do(ctx, what, http.MethodPost, instancePath(name, "scale"), map[string]any{"replicas": n}, &done); err != nil {
 		return fail(err)
 	}
 	if !*wait {
 		fmt.Fprintf(stdout, "asked for %d — follow it with zae platform status --url %s\n", n, base)
 		return exitcode.OK
 	}
+	r := rolloutOf(done, w)
 	return follow(ctx, c, fmt.Sprintf("%s to run %d", name, n), fmt.Sprintf("%s runs %d", name, n),
-		*timeout, false, workloadSettled(name, n))
+		*timeout, r.exact, workloadSettled(name, n, r))
 }
 
 // askFirst asks before a change, unless --yes was given or the platform

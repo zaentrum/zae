@@ -3,6 +3,7 @@ package platform
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -36,9 +37,17 @@ type fakePortal struct {
 
 	token string // required bearer, "" for none
 
-	reads   int
-	onGet   func(p *fakePortal, n int)
-	onWrite func(p *fakePortal)
+	// legacy is a portal-api from before the exact wait: every write answers
+	// 204 with nothing, and the console reports no generations. zae has to
+	// keep working against it, and has to say that its wait is weaker.
+	legacy bool
+	// stamps counts the restart stamps written, so each is a new one.
+	stamps int
+
+	reads       int
+	onGet       func(p *fakePortal, n int)
+	onWrite     func(p *fakePortal)
+	beforeApply func(p *fakePortal)
 }
 
 func newPortal(t *testing.T) (*fakePortal, *httptest.Server) {
@@ -47,7 +56,7 @@ func newPortal(t *testing.T) (*fakePortal, *httptest.Server) {
 		available: true,
 		op: Operator{Present: true, Name: "zaentrum", Channel: "stable", Version: "1.4.0",
 			UpdateMode: "manual", Hostname: "media.example.org", Phase: "Ready",
-			CurrentVersion: "1.4.0", AvailableUpdate: "1.5.0"},
+			CurrentVersion: "1.4.0", AvailableUpdate: "1.5.0", Generation: 7, ObservedGeneration: 7},
 		workloads: exampleWorkloads(),
 	}
 	mux := http.NewServeMux()
@@ -80,16 +89,21 @@ func newPortal(t *testing.T) (*fakePortal, *httptest.Server) {
 func exampleWorkloads() []Workload {
 	return []Workload{
 		{Name: "chino-api", Image: "ghcr.io/example/chino-api:1.4.0", DesiredReplicas: 2, ReadyReplicas: 2,
-			UpdatedReplicas: 2, AvailableReplicas: 2, Phase: PhaseReady, OperatorManaged: true, Group: GroupPlatform},
+			UpdatedReplicas: 2, AvailableReplicas: 2, Phase: PhaseReady, OperatorManaged: true, Group: GroupPlatform,
+			Generation: 3, ObservedGeneration: 3, RestartedAt: "2026-09-20T08:00:00Z"},
 		{Name: "example-worker", Image: "ghcr.io/example/worker:2.0.0", DesiredReplicas: 1, ReadyReplicas: 1,
-			UpdatedReplicas: 1, Phase: PhaseReady, Group: GroupAddon, Addon: "example"},
+			UpdatedReplicas: 1, AvailableReplicas: 1, Phase: PhaseReady, Group: GroupAddon, Addon: "example",
+			Generation: 1, ObservedGeneration: 1},
 		{Name: "katalog-api", Image: "ghcr.io/example/katalog-api@sha256:" + strings.Repeat("a", 64),
 			DesiredReplicas: 1, ReadyReplicas: 0, UpdatedReplicas: 1, Phase: PhaseDegraded,
-			OperatorManaged: true, Group: GroupPlatform, Reason: "ImagePullBackOff"},
+			OperatorManaged: true, Group: GroupPlatform, Reason: "ImagePullBackOff",
+			Generation: 2, ObservedGeneration: 2},
 		{Name: "leftover", Image: "ghcr.io/example/leftover", DesiredReplicas: 1, ReadyReplicas: 1,
-			UpdatedReplicas: 1, Phase: PhaseReady, Group: GroupOther},
+			UpdatedReplicas: 1, AvailableReplicas: 1, Phase: PhaseReady, Group: GroupOther,
+			Generation: 1, ObservedGeneration: 1},
 		{Name: "postgres", Image: "postgres:16", DesiredReplicas: 1, ReadyReplicas: 1, UpdatedReplicas: 1,
-			Phase: PhaseReady, OperatorManaged: true, Group: GroupPlatform, Protected: true},
+			AvailableReplicas: 1, Phase: PhaseReady, OperatorManaged: true, Group: GroupPlatform, Protected: true,
+			Generation: 1, ObservedGeneration: 1},
 	}
 }
 
@@ -103,12 +117,47 @@ func (p *fakePortal) get(w http.ResponseWriter, r *http.Request) {
 			"operator": map[string]any{"present": false, "note": noManagement + " (not running in a cluster)"}})
 		return
 	}
-	out := map[string]any{"available": true, "operator": p.op, "instances": p.workloads}
+	out := map[string]any{"available": true, "operator": p.strip(p.op), "instances": p.instances()}
 	if p.listError != "" {
 		out["error"] = p.listError
 		out["instances"] = []any{}
 	}
 	writeJSON(w, out)
+}
+
+// instances renders the workload list the way this portal serves it — a legacy
+// one has never heard of the rollout fields and sends none.
+func (p *fakePortal) instances() []any {
+	out := make([]any, 0, len(p.workloads))
+	for _, wl := range p.workloads {
+		out = append(out, p.strip(wl))
+	}
+	return out
+}
+
+// strip round-trips a DTO through JSON and, for a legacy portal, removes the
+// fields it never had. Absent is not the same as zero on the wire, and zae's
+// fallback has to be driven by what a real old portal sends.
+func (p *fakePortal) strip(v any) map[string]any {
+	raw, _ := json.Marshal(v)
+	var m map[string]any
+	_ = json.Unmarshal(raw, &m)
+	if p.legacy {
+		for _, k := range []string{"generation", "observedGeneration", "restartedAt"} {
+			delete(m, k)
+		}
+	}
+	return m
+}
+
+// answer writes what a write produced, or nothing at all when this portal
+// predates saying so.
+func (p *fakePortal) answer(w http.ResponseWriter, v any) {
+	if p.legacy {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	writeJSON(w, v)
 }
 
 func (p *fakePortal) patch(w http.ResponseWriter, r *http.Request) {
@@ -133,18 +182,37 @@ func (p *fakePortal) patch(w http.ResponseWriter, r *http.Request) {
 	if body.UpdateMode != nil {
 		p.op.UpdateMode = *body.UpdateMode
 	}
+	p.op.Generation++
 	p.wrote()
-	w.WriteHeader(http.StatusNoContent)
+	p.answer(w, updated{Version: p.op.Version, Generation: p.op.Generation})
 }
 
 func (p *fakePortal) applyUpdate(w http.ResponseWriter, r *http.Request) {
-	if p.op.AvailableUpdate == "" {
+	// beforeApply is somebody else moving the shelf between the read zae based
+	// its question on and the write that answers it.
+	if p.beforeApply != nil {
+		p.beforeApply(p)
+	}
+	// The body is optional, and a legacy portal ignores it entirely.
+	var body struct {
+		Version string `json:"version"`
+	}
+	if !decodeOptional(w, r, &body) {
+		return
+	}
+	switch {
+	case p.op.AvailableUpdate == "":
 		http.Error(w, "no update available", http.StatusBadRequest)
+		return
+	case !p.legacy && body.Version != "" && body.Version != p.op.AvailableUpdate:
+		http.Error(w, fmt.Sprintf("the available update changed: %s is on the %s channel now, not %s",
+			p.op.AvailableUpdate, p.op.Channel, body.Version), http.StatusConflict)
 		return
 	}
 	p.op.Version = p.op.AvailableUpdate
+	p.op.Generation++
 	p.wrote()
-	w.WriteHeader(http.StatusNoContent)
+	p.answer(w, updated{Version: p.op.Version, Generation: p.op.Generation})
 }
 
 func (p *fakePortal) scale(w http.ResponseWriter, r *http.Request) {
@@ -157,7 +225,7 @@ func (p *fakePortal) scale(w http.ResponseWriter, r *http.Request) {
 	wl := p.workload(r.PathValue("name"))
 	switch {
 	case wl == nil:
-		http.Error(w, fmt.Sprintf("deployments %q not found", r.PathValue("name")), http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("no such workload: %s", r.PathValue("name")), http.StatusNotFound)
 	case wl.Protected:
 		http.Error(w, fmt.Sprintf("%q is a protected (stateful) service and cannot be scaled from here",
 			wl.Name), http.StatusBadRequest)
@@ -166,23 +234,31 @@ func (p *fakePortal) scale(w http.ResponseWriter, r *http.Request) {
 	default:
 		wl.DesiredReplicas = body.Replicas
 		wl.Phase = PhaseProgressing
+		wl.Generation++
 		p.wrote()
-		w.WriteHeader(http.StatusNoContent)
+		p.answer(w, write{Name: wl.Name, Generation: wl.Generation, RestartedAt: wl.RestartedAt})
 	}
 }
 
+// restart models the cluster exactly as it behaves, which is the whole reason
+// this work exists: the write stamps the pod template and bumps the
+// generation, and NOTHING about the replica counters changes. For the next
+// several seconds they describe the pods from before the restart — ready,
+// updated, available, all of it true of the wrong pods.
 func (p *fakePortal) restart(w http.ResponseWriter, r *http.Request) {
 	wl := p.workload(r.PathValue("name"))
 	switch {
 	case wl == nil:
-		http.Error(w, fmt.Sprintf("deployments %q not found", r.PathValue("name")), http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("no such workload: %s", r.PathValue("name")), http.StatusNotFound)
 	case wl.Protected:
 		http.Error(w, fmt.Sprintf("%q is a protected (stateful) service and cannot be restarted from here",
 			wl.Name), http.StatusBadRequest)
 	default:
-		wl.ReadyReplicas, wl.UpdatedReplicas, wl.Phase = 0, 0, PhaseProgressing
+		p.stamps++
+		wl.Generation++
+		wl.RestartedAt = fmt.Sprintf("2026-09-21T10:0%d:00Z", p.stamps)
 		p.wrote()
-		w.WriteHeader(http.StatusNoContent)
+		p.answer(w, write{Name: wl.Name, Generation: wl.Generation, RestartedAt: wl.RestartedAt})
 	}
 }
 
@@ -201,9 +277,20 @@ func (p *fakePortal) wrote() {
 	}
 }
 
-// ready brings every workload to its desired replica count, as a rollout
-// that finished would.
+// ready brings every workload to its desired replica count and marks the
+// cluster as having acted on the spec it has, as a rollout that finished
+// would.
 func (p *fakePortal) ready() {
+	p.readyCounters()
+	for i := range p.workloads {
+		p.workloads[i].ObservedGeneration = p.workloads[i].Generation
+	}
+}
+
+// readyCounters makes every counter say ready while leaving the generations
+// where they are — the state a rollout that has not started yet reports,
+// because those counters are about the pods from before it.
+func (p *fakePortal) readyCounters() {
 	for i := range p.workloads {
 		w := &p.workloads[i]
 		w.ReadyReplicas, w.UpdatedReplicas, w.AvailableReplicas = w.DesiredReplicas, w.DesiredReplicas, w.DesiredReplicas
@@ -243,6 +330,17 @@ func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
+		http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
+		return false
+	}
+	return true
+}
+
+// decodeOptional mirrors the decoder for a body a caller may leave out.
+func decodeOptional(w http.ResponseWriter, r *http.Request, dst any) bool {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil && !errors.Is(err, io.EOF) {
 		http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
 		return false
 	}
@@ -560,9 +658,14 @@ func TestUpdateWaitsUntilTheVersionIsRunningAndEverythingIsReady(t *testing.T) {
 		switch {
 		case n >= after+5:
 			p.op.Phase, p.op.CurrentVersion, p.op.AvailableUpdate = "Ready", "1.5.0", ""
+			p.op.ObservedGeneration = p.op.Generation
 			p.ready()
 		case n >= after+3:
+			// The version is reported, and every workload reads ready — but the
+			// operator has not reconciled this write yet. Before generations,
+			// this is where a wait declared victory.
 			p.op.Phase, p.op.CurrentVersion = "Reconciling", "1.5.0"
+			p.readyCounters()
 		default:
 			p.op.Phase = "Reconciling"
 		}
@@ -713,8 +816,111 @@ func TestScaleWaitsForTheReplicaCount(t *testing.T) {
 	if code != exitcode.OK || !strings.Contains(out, "chino-api is ready") {
 		t.Fatalf("restart --wait: want 0, got %d\n%s\n%s", code, out, errs)
 	}
-	if !strings.Contains(out, "chino-api 0/2 progressing") {
+	if !strings.Contains(out, "the rollout has not started yet") {
 		t.Errorf("the wait must show the rollout it waited through:\n%s", out)
+	}
+}
+
+// The live failure, in a test: a restart is asked for, the cluster has not
+// acted on it yet, and every replica counter says ready — of the pod from
+// before the restart. The wait must not believe them.
+func TestRestartWaitsForTheNewRolloutAndNotForTheOldPods(t *testing.T) {
+	p, srv := newPortal(t)
+	restarted, done := 0, 0
+	p.onWrite = func(p *fakePortal) {
+		// Exactly what the cluster does: the spec moved, the counters did not.
+		restarted = p.reads
+	}
+	p.onGet = func(p *fakePortal, n int) {
+		if restarted > 0 && n >= restarted+3 {
+			done = n
+			p.ready()
+		}
+	}
+	code, out, errs := run(t, "", false, "restart", "chino-api", "--url", srv.URL, "--yes", "--wait", "--timeout", "10s")
+	if code != exitcode.OK {
+		t.Fatalf("want 0, got %d\n%s\n%s", code, out, errs)
+	}
+	if !strings.Contains(out, "the rollout has not started yet") {
+		t.Fatalf("the wait must refuse the pods from before the restart:\n%s", out)
+	}
+	if done == 0 || p.reads < done {
+		t.Fatalf("the wait ended before the rollout was observed (reads=%d, rollout at %d)", p.reads, done)
+	}
+	// And it was not the old stamp it settled on.
+	if wl := p.workload("chino-api"); wl.RestartedAt == "2026-09-20T08:00:00Z" {
+		t.Errorf("the restart stamp must have moved: %q", wl.RestartedAt)
+	}
+	// Nothing about a readiness-gate-only wait is said, because this one is not.
+	if strings.Contains(out, "readiness gate") {
+		t.Errorf("an exact wait must not warn about a weaker one:\n%s", out)
+	}
+}
+
+// Against a portal-api that predates the rollout fields, zae still works —
+// and says, once, that its wait is the weaker one. Silently falling back is
+// the thing that made the original bug invisible.
+func TestWaitFallsBackAndSaysSoOnAnOlderPortal(t *testing.T) {
+	p, srv := newPortal(t)
+	p.legacy = true
+
+	code, out, errs := run(t, "", false, "restart", "chino-api", "--url", srv.URL, "--yes", "--wait", "--timeout", "10s")
+	if code != exitcode.OK {
+		t.Fatalf("want 0, got %d\n%s\n%s", code, out, errs)
+	}
+	if !strings.Contains(out, "readiness gate") || !strings.Contains(out, "predates the exact wait") {
+		t.Fatalf("zae must say the wait is weaker here:\n%s", out)
+	}
+	if n := strings.Count(out, "readiness gate"); n != 1 {
+		t.Errorf("said %d times, want once:\n%s", n, out)
+	}
+	// The write still happened, and an update still works the same way.
+	if p.called("POST "+operatorPath+"/instances/chino-api/restart") != 1 {
+		t.Fatalf("the restart must still be sent: %v", p.calls)
+	}
+	p2, srv2 := newPortal(t)
+	p2.legacy = true
+	p2.onGet = func(p *fakePortal, n int) {
+		if p.called("POST "+applyPath) > 0 {
+			p.op.CurrentVersion, p.op.Phase = "1.5.0", "Ready"
+			p.ready()
+		}
+	}
+	code, out, errs = run(t, "", false, "update", "--url", srv2.URL, "--apply", "--yes", "--wait", "--timeout", "10s")
+	if code != exitcode.OK || !strings.Contains(out, "readiness gate") {
+		t.Fatalf("update against an older portal: want 0 with the note, got %d\n%s\n%s", code, out, errs)
+	}
+}
+
+// --apply names the update it decided on, so the platform can refuse one that
+// moved underneath rather than rolling to a version nobody chose.
+func TestApplySendsTheVersionItDecidedOn(t *testing.T) {
+	p, srv := newPortal(t)
+	code, out, errs := run(t, "", false, "update", "--url", srv.URL, "--apply", "--yes")
+	if code != exitcode.OK {
+		t.Fatalf("want 0, got %d\n%s\n%s", code, out, errs)
+	}
+	body := p.body(t, "POST "+applyPath, 0)
+	if body["version"] != "1.5.0" {
+		t.Fatalf("--apply must name the update it read: %v", body)
+	}
+
+	// It moved between the read zae based its question on and the write that
+	// answers it: the platform refuses, and zae reports that refusal with what
+	// to do about it.
+	p2, srv2 := newPortal(t)
+	p2.beforeApply = func(p *fakePortal) { p.op.AvailableUpdate = "2.0.0-rc1" }
+	code, out, errs = run(t, "", false, "update", "--url", srv2.URL, "--apply", "--yes")
+	if code != exitcode.Failed {
+		t.Fatalf("a moved update: want 1, got %d\n%s\n%s", code, out, errs)
+	}
+	for _, s := range []string{"2.0.0-rc1", "look again with: zae platform status"} {
+		if !strings.Contains(errs, s) {
+			t.Errorf("the refusal must carry %q: %q", s, errs)
+		}
+	}
+	if p2.op.Version != "1.4.0" {
+		t.Errorf("a refused apply must change nothing: %q", p2.op.Version)
 	}
 }
 
