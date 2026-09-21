@@ -67,3 +67,37 @@ func TestFindIsExact(t *testing.T) {
 		t.Fatal("service names are case-sensitive; no guessing")
 	}
 }
+
+// `auth` is the field the instance and the CLI must agree on letter for
+// letter — it lives in one repo and is read in another. Pin the spelling, and
+// pin that a document without it still parses: that is every instance that
+// predates the field.
+func TestAuthIsReadAndOptional(t *testing.T) {
+	with := serve(200, `{"capabilityVersion":1,
+		"auth":{"issuer":"https://media.example.org/auth/realms/zaentrum","clientId":"zae"},
+		"services":[]}`)
+	defer with.Close()
+	d, err := Fetch(context.Background(), with.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.Auth.Usable() || d.Auth.Issuer != "https://media.example.org/auth/realms/zaentrum" || d.Auth.ClientID != "zae" {
+		t.Fatalf("auth did not survive the wire: %+v", d.Auth)
+	}
+
+	without := serve(200, `{"capabilityVersion":1,"services":[]}`)
+	defer without.Close()
+	d, err = Fetch(context.Background(), without.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Auth.Usable() {
+		t.Fatalf("an instance that says nothing must not look configured: %+v", d.Auth)
+	}
+	// Half an answer is not an answer: a login needs both.
+	half := serve(200, `{"capabilityVersion":1,"auth":{"issuer":"https://media.example.org"},"services":[]}`)
+	defer half.Close()
+	if d, _ := Fetch(context.Background(), half.URL); d.Auth.Usable() {
+		t.Fatalf("an issuer without a client id is not usable on its own: %+v", d.Auth)
+	}
+}
