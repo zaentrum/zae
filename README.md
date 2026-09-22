@@ -177,7 +177,13 @@ postgres        platform       16                   1/1    ready     -
 example-worker  addon:example  2.0.0                1/1    ready     -
 leftover        other          latest               1/1    ready     -
 
-Not covered here: the operator's own controller image. …
+the operator's controller
+  version      v0.4.1
+  image        ghcr.io/zaentrum/operator:v0.4.1
+  installed    OLM — a subscription the cluster manages
+  update       v0.5.0 available
+  observed     2026-09-22T08:00:00Z
+Updated outside the platform: approve the update in its OLM subscription.
 
 $ zae platform update --apply --wait --url https://media.example.org
 https://media.example.org — the platform
@@ -193,17 +199,30 @@ the platform reports 1.5.0, and every workload the operator manages is ready
 
 | command | does |
 |---|---|
-| `zae platform status --url …` | the version the platform is pinned to — or that nothing is pinned and it follows a channel — the channel, the update mode, the phase, the version it reports running, whether an update is offered; then every workload, grouped: what the operator renders, then addons, then whatever neither claims. `--json` prints the portal's own document |
+| `zae platform status --url …` | the version the platform is pinned to — or that nothing is pinned and it follows a channel — the channel, the update mode, the phase, the version it reports running, whether an update is offered; then every workload, grouped: what the operator renders, then addons, then whatever neither claims; then the operator's own controller. `--json` prints the portal's own document |
+| `zae platform controller --url …` | that last section on its own, for scripts: the version in charge, its image, how it was installed, whether something newer was found — and the one line naming what updates it. `--json` prints the portal's own `controller` document, always an object |
 | `zae platform update --url …` | `--version V` pins an image tag (`--version latest` follows the channel again), `--channel C` picks the release train, `--mode auto\|manual` decides whether the operator updates itself, `--apply` pins the update it has already discovered |
 | `zae platform restart <workload> --url …` | rolls one workload |
 | `zae platform scale <workload> <replicas> --url …` | sets one workload's replica count |
 
-- **What it does not cover: the operator's own controller image.** The
-  controller runs in its own namespace, outside the one the portal
-  administers, so zae can neither read nor change the controller's version.
-  Update it by applying its install bundle — or through OLM, where the cluster
-  installs it that way. `zae platform` updates the platform that controller
-  deploys, which is the other half.
+- **The controller is shown, never updated.** It runs in its own namespace,
+  outside the one the portal administers, and it is installed and upgraded
+  outside the product — so zae reports what is in charge and names the path for
+  the source the operator declares:
+
+  | source | what updates it |
+  |---|---|
+  | `olm` | approve the update in its OLM subscription |
+  | `manifest` | apply the pinned install manifest, usually through the deployment repository that holds it |
+  | `appliance` | update the appliance — its own update carries the controller |
+  | `unknown` | whichever of the three installed it |
+
+  There is no flag that does any of them. An operator that reports no
+  controller — every operator older than the field — says so, and
+  `zae platform controller` exits `3` (not offered by this instance) so a
+  script can branch on it; a `status` is unaffected and still exits `0`.
+  `zae platform` updates the platform that controller *deploys*, which is the
+  other half of the job and the half that happens far more often.
 - **`--apply` takes no version of its own — and names the one it read.** It
   pins the platform to what the operator discovered, so `--apply --version V`
   is a usage error (`2`), and so is `--apply --channel C`: the update on the
@@ -348,7 +367,7 @@ still wins, for service accounts and CI.
 | Instance-side capability discovery (`/api/portal/cli/discovery`) | ✅ served by portal-api; acquire is the first service declaring itself (10 commands) |
 | Running discovered commands, with the exit-code contract and `zae require` | ✅ v0.2 |
 | `zae addon add/list/status/upgrade/remove` (charts installed by the operator) | 🔶 built against the addon chart API; needs an instance whose portal-api and operator ship it |
-| `zae platform status/update/restart/scale` (the operator console) | 🔶 built against the portal's operator console; needs an operator-managed instance — an older portal-api works, with a weaker `--wait` that says so. The operator's own controller image is out of scope — that is its install bundle |
+| `zae platform status/controller/update/restart/scale` (the operator console) | 🔶 built against the portal's operator console; needs an operator-managed instance — an older portal-api works, with a weaker `--wait` that says so. `controller` shows what is in charge and names where it is updated; updating it is out of scope by design |
 | `zae login` / `logout` / `whoami` (device grant with PKCE, refresh, per-instance sessions) | 🔶 built; needs a portal-api that advertises `auth` and an operator-created public client |
 | Registered checks, `events tail`, journey smoke tests, `addon lint` | 🧭 next — discovery and login are in place |
 

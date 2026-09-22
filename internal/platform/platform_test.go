@@ -58,7 +58,8 @@ func newPortal(t *testing.T) (*fakePortal, *httptest.Server) {
 		available: true,
 		op: Operator{Present: true, Name: "zaentrum", Channel: "stable", Version: "1.4.0",
 			UpdateMode: "manual", Hostname: "media.example.org", Phase: "Ready",
-			CurrentVersion: "1.4.0", AvailableUpdate: "1.5.0", Generation: 7, ObservedGeneration: 7},
+			CurrentVersion: "1.4.0", AvailableUpdate: "1.5.0", Generation: 7, ObservedGeneration: 7,
+			Controller: exampleController()},
 		workloads: exampleWorkloads(),
 	}
 	mux := http.NewServeMux()
@@ -112,6 +113,16 @@ func exampleWorkloads() []Workload {
 
 func pods(n int) *int { return &n }
 
+// exampleController is what an operator reports about itself: installed by a
+// subscription, with a newer build already found on the channel — the state
+// that has to end in "go and approve it there", never in a flag.
+func exampleController() *Controller {
+	return &Controller{
+		Image: "ghcr.io/example/operator:v0.4.1", Version: "v0.4.1", Source: SourceOLM,
+		AvailableUpdate: "v0.5.0", ObservedAt: "2026-09-22T08:00:00Z",
+	}
+}
+
 func (p *fakePortal) get(w http.ResponseWriter, r *http.Request) {
 	p.reads++
 	if p.onGet != nil {
@@ -148,7 +159,9 @@ func (p *fakePortal) strip(v any) map[string]any {
 	var m map[string]any
 	_ = json.Unmarshal(raw, &m)
 	if p.legacy {
-		for _, k := range []string{"generation", "observedGeneration", "restartedAt", "replicas"} {
+		// The controller is newer than the rollout fields, so a portal that
+		// has never heard of those has certainly never heard of it.
+		for _, k := range []string{"generation", "observedGeneration", "restartedAt", "replicas", "controller"} {
 			delete(m, k)
 		}
 	}
@@ -425,8 +438,15 @@ func TestStatusRendersThePlatformAndItsWorkloads(t *testing.T) {
 		"1.5.0 available — apply it with: zae platform update --apply --url " + srv.URL,
 		"host         media.example.org",
 		"NAME", "GROUP", "IMAGE", "READY", "PHASE", "REASON",
-		"Not covered here: the operator's own controller image.",
-		"applying its install bundle",
+		// The section that replaced "Not covered here": what is in charge,
+		// and the one path that changes it.
+		"the operator's controller",
+		"version      v0.4.1",
+		"image        ghcr.io/example/operator:v0.4.1",
+		"installed    OLM — a subscription the cluster manages",
+		"update       v0.5.0 available",
+		"observed     2026-09-22T08:00:00Z",
+		"Updated outside the platform: approve the update in its OLM subscription.",
 	} {
 		if !strings.Contains(out, s) {
 			t.Errorf("status lacks %q:\n%s", s, out)
@@ -520,11 +540,244 @@ func TestStatusJSONIsThePortalsOwnDocument(t *testing.T) {
 	if !got.Instances[4].Protected {
 		t.Errorf("--json lost `protected`: %+v", got.Instances[4])
 	}
+	// --json carries the same controller fields the rendering does, so a
+	// script watching for a newer controller reads them from here.
+	c := got.Operator.Controller
+	if c == nil || c.Version != "v0.4.1" || c.Source != SourceOLM || c.AvailableUpdate != "v0.5.0" ||
+		c.Image != "ghcr.io/example/operator:v0.4.1" || c.ObservedAt == "" {
+		t.Errorf("--json lost the controller: %+v", c)
+	}
 	// Nothing of the rendering leaks into the machine-readable form.
-	for _, s := range []string{"NAME", "Not covered here", "— pinned"} {
+	for _, s := range []string{"NAME", "Updated outside the platform", "— pinned"} {
 		if strings.Contains(out, s) {
 			t.Errorf("--json carries rendered text %q:\n%s", s, out)
 		}
+	}
+}
+
+// Each install source sends a reader to a DIFFERENT place, which is the only
+// reason the operator reports the source at all. Naming the wrong one is worse
+// than naming none: it sends an administrator to a subscription that does not
+// exist, or to a manifest that did not install this cluster.
+func TestStatusNamesTheUpgradePathForEverySource(t *testing.T) {
+	cases := []struct {
+		name       string
+		controller *Controller
+		installed  string
+		path       string
+	}{
+		{"olm", &Controller{Version: "v0.4.1", Image: "ghcr.io/example/operator:v0.4.1", Source: SourceOLM},
+			"installed    OLM — a subscription the cluster manages",
+			"Updated outside the platform: approve the update in its OLM subscription."},
+		{"manifest", &Controller{Version: "v0.4.1", Image: "ghcr.io/example/operator:v0.4.1", Source: SourceManifest},
+			"installed    its install manifest",
+			"Updated outside the platform: apply the pinned install manifest, usually through the deployment repository that holds it."},
+		{"appliance", &Controller{Version: "v0.4.1", Image: "ghcr.io/example/operator:v0.4.1", Source: SourceAppliance},
+			"installed    the appliance",
+			"Updated outside the platform: update the appliance — its own update carries the controller."},
+		{"unknown", &Controller{Version: "v0.4.1", Image: "ghcr.io/example/operator:v0.4.1", Source: SourceUnknown},
+			"installed    not reported",
+			"Updated outside the platform: update it where it was installed from — an OLM subscription, the install manifest, or the appliance."},
+		// A source this zae has not heard of is shown, not erased: not knowing
+		// the word is not the same as the word being untrue.
+		{"a source zae does not know", &Controller{Version: "v0.4.1", Image: "ghcr.io/example/operator:v0.4.1", Source: "helm"},
+			"installed    helm",
+			"Updated outside the platform: update it where it was installed from (helm)."},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p, srv := newPortal(t)
+			p.op.Controller = c.controller
+			code, out, errs := run(t, "", false, "status", "--url", srv.URL)
+			if code != exitcode.OK {
+				t.Fatalf("want 0, got %d\n%s\n%s", code, out, errs)
+			}
+			for _, want := range []string{"the operator's controller", "version      v0.4.1", c.installed, c.path} {
+				if !strings.Contains(out, want) {
+					t.Errorf("status lacks %q:\n%s", want, out)
+				}
+			}
+			// A status is a read, whatever it says about the controller.
+			for _, call := range p.calls {
+				if !strings.HasPrefix(call, "GET ") {
+					t.Errorf("status wrote something: %v", p.calls)
+				}
+			}
+		})
+	}
+}
+
+// What the controller reports about updates is information, never a step: an
+// update on the channel is named, and what applies it is the line after it.
+func TestStatusControllerUpdateLine(t *testing.T) {
+	cases := map[string]struct {
+		version, update string
+		want            string
+	}{
+		"something newer":              {"v0.4.1", "v0.5.0", "update       v0.5.0 available"},
+		"the channel offers what runs": {"v0.4.1", "v0.4.1", "update       v0.4.1 — already running"},
+		// Not "none offered": an operator installed from a manifest may never
+		// look, and claiming a check that did not run is a lie about a fact.
+		"nothing reported": {"v0.4.1", "", "update       none reported"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			p, srv := newPortal(t)
+			p.op.Controller = &Controller{Version: c.version, Image: "ghcr.io/example/operator:" + c.version,
+				Source: SourceOLM, AvailableUpdate: c.update}
+			_, out, _ := run(t, "", false, "status", "--url", srv.URL)
+			if !strings.Contains(out, c.want) {
+				t.Errorf("status lacks %q:\n%s", c.want, out)
+			}
+			if strings.Contains(out, "zae platform controller update") {
+				t.Errorf("zae must not offer a command that updates the controller:\n%s", out)
+			}
+		})
+	}
+}
+
+// An operator older than the field reports nothing. Silence would read as
+// "there is no controller", so the status says what it cannot say — and where
+// the thing it cannot see is updated, which has not changed.
+func TestStatusWhenTheOperatorReportsNoController(t *testing.T) {
+	for name, prepare := range map[string]func(p *fakePortal){
+		"no controller at all":      func(p *fakePortal) { p.op.Controller = nil },
+		"a controller with nothing": func(p *fakePortal) { p.op.Controller = &Controller{} },
+		"a portal that predates it": func(p *fakePortal) { p.legacy = true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			p, srv := newPortal(t)
+			prepare(p)
+			code, out, errs := run(t, "", false, "status", "--url", srv.URL)
+			if code != exitcode.OK {
+				t.Fatalf("a status is still a status: %d\n%s\n%s", code, out, errs)
+			}
+			for _, want := range []string{
+				"the operator's controller",
+				"not reported by this operator, so zae cannot say what version is in charge",
+				"Updated outside the platform: update it where it was installed from",
+			} {
+				if !strings.Contains(out, want) {
+					t.Errorf("status lacks %q:\n%s", want, out)
+				}
+			}
+			// Nothing invented to fill the gap.
+			if strings.Contains(out, "installed    ") || strings.Contains(out, "version      unknown") {
+				t.Errorf("an unreported controller must not render fields:\n%s", out)
+			}
+		})
+	}
+}
+
+// The focused view is the same section on its own, for a script.
+func TestControllerCommand(t *testing.T) {
+	p, srv := newPortal(t)
+	code, out, errs := run(t, "", false, "controller", "--url", srv.URL)
+	if code != exitcode.OK {
+		t.Fatalf("want 0, got %d\n%s\n%s", code, out, errs)
+	}
+	for _, want := range []string{
+		srv.URL + " — the operator's controller",
+		"version      v0.4.1",
+		"image        ghcr.io/example/operator:v0.4.1",
+		"installed    OLM — a subscription the cluster manages",
+		"update       v0.5.0 available",
+		"Updated outside the platform: approve the update in its OLM subscription.",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("controller lacks %q:\n%s", want, out)
+		}
+	}
+	// It is a read: the workload table belongs to status, and no write exists.
+	if strings.Contains(out, "NAME") {
+		t.Errorf("the focused view prints only the controller:\n%s", out)
+	}
+	if p.called("GET "+operatorPath) != 1 || len(p.calls) != 1 {
+		t.Errorf("controller reads once and writes nothing: %v", p.calls)
+	}
+}
+
+// --json is the portal's own sub-document, and always an object: a script
+// addresses .version the same way against an instance that reports nothing.
+func TestControllerJSONIsThePortalsOwnDocument(t *testing.T) {
+	_, srv := newPortal(t)
+	code, out, errs := run(t, "", false, "controller", "--url", srv.URL, "--json")
+	if code != exitcode.OK {
+		t.Fatalf("want 0, got %d %s", code, errs)
+	}
+	var got Controller
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("--json is not the controller document: %v\n%s", err, out)
+	}
+	if got.Version != "v0.4.1" || got.Source != SourceOLM || got.AvailableUpdate != "v0.5.0" ||
+		got.Image != "ghcr.io/example/operator:v0.4.1" || got.ObservedAt == "" {
+		t.Errorf("--json lost fields: %+v", got)
+	}
+	for _, s := range []string{"installed", "Updated outside the platform"} {
+		if strings.Contains(out, s) {
+			t.Errorf("--json carries rendered text %q:\n%s", s, out)
+		}
+	}
+
+	// An instance that reports no controller: still an object, and exit 3 —
+	// not offered BY THIS INSTANCE is a state a script can branch on.
+	p2, srv2 := newPortal(t)
+	p2.op.Controller = nil
+	code, out, errs = run(t, "", false, "controller", "--url", srv2.URL, "--json")
+	if code != exitcode.NotOffered {
+		t.Fatalf("want 3, got %d\n%s\n%s", code, out, errs)
+	}
+	var empty map[string]any
+	if err := json.Unmarshal([]byte(out), &empty); err != nil || len(empty) != 0 {
+		t.Errorf("--json must stay an object: %v (%q)", err, out)
+	}
+	if !strings.Contains(errs, "does not report the operator's controller") {
+		t.Errorf("the reason must be said: %q", errs)
+	}
+}
+
+// Typing an upgrade is the likeliest mistake here, so the refusal answers the
+// question behind it instead of "unknown argument".
+func TestControllerTakesNoArgumentsAndSaysWhereTheUpgradeHappens(t *testing.T) {
+	p, srv := newPortal(t)
+	for _, args := range [][]string{
+		{"controller", "update", "--url", srv.URL},
+		{"controller", "--url", srv.URL, "upgrade"},
+	} {
+		code, out, errs := run(t, "", true, args...)
+		if code != exitcode.Usage {
+			t.Errorf("%v: want 2, got %d\n%s\n%s", args, code, out, errs)
+		}
+		for _, want := range []string{"nothing in zae updates it", "OLM subscription", "install manifest", "appliance"} {
+			if !strings.Contains(errs, want) {
+				t.Errorf("%v: the refusal lacks %q: %q", args, want, errs)
+			}
+		}
+	}
+	if len(p.calls) != 0 {
+		t.Errorf("a usage error must reach no instance: %v", p.calls)
+	}
+	// And the command list says the same thing.
+	if _, out, _ := run(t, "", false, "help"); !strings.Contains(out, "zae platform controller --url") ||
+		!strings.Contains(out, "There is no command that updates it") {
+		t.Errorf("the help must offer controller and refuse to update it:\n%s", out)
+	}
+}
+
+// An instance with no console to drive cannot answer this either, and says so
+// the same way status does — in the portal's own words.
+func TestControllerWithoutAnOperatorConsole(t *testing.T) {
+	p, srv := newPortal(t)
+	p.op = Operator{Present: false, Note: "no operator detected — managing deployments directly"}
+	code, out, errs := run(t, "", false, "controller", "--url", srv.URL)
+	if code != exitcode.NotOffered {
+		t.Fatalf("want 3, got %d\n%s\n%s", code, out, errs)
+	}
+	if !strings.Contains(errs, "no operator detected") {
+		t.Errorf("the portal's own note must be printed: %q", errs)
+	}
+	if strings.Contains(out, "version") {
+		t.Errorf("nothing to report, nothing rendered:\n%s", out)
 	}
 }
 

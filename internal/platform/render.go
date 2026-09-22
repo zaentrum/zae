@@ -8,18 +8,17 @@ import (
 	"text/tabwriter"
 )
 
-// controllerNote is the boundary of this command group, printed with every
-// status and repeated in the docs. It is a fact about where the two pieces
-// run, not a shortcoming: the portal administers the platform's namespace,
-// and the controller that deploys the platform runs outside it.
-const controllerNote = `Not covered here: the operator's own controller image. The controller runs in
-its own namespace, outside the one the portal administers, so zae can neither
-read nor change the version of the controller itself. Update the controller by
-applying its install bundle — or through OLM, on a cluster that installs it
-that way. This command updates the platform the controller deploys.`
+// controllerHeading opens the controller section of a status.
+const controllerHeading = "the operator's controller"
+
+// controllerUnreported is what an operator older than the field leaves zae
+// able to say. Saying it beats silence: silence reads as "there is no
+// controller", and where it is updated is the same either way.
+const controllerUnreported = "not reported by this operator, so zae cannot say what version is in charge"
 
 // renderStatus prints the platform on one screen: what it was asked to run,
-// what it reports running, and every workload beside it.
+// what it reports running, every workload beside it — and, last, the one piece
+// of all this that the platform does not update: its own controller.
 func renderStatus(w io.Writer, base string, c *Console) {
 	op := c.Operator
 	fmt.Fprintf(w, "%s — the platform\n", base)
@@ -39,7 +38,97 @@ func renderStatus(w io.Writer, base string, c *Console) {
 	fmt.Fprintln(w)
 	renderWorkloads(w, c)
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, controllerNote)
+	renderController(w, controllerHeading, op.Controller)
+}
+
+// renderController prints the operator's own controller: what is in charge,
+// how it got there, whether something newer exists — and then ONE line, which
+// is the point of the whole section: the platform does not update this, and
+// here is what does.
+//
+// It replaces a paragraph that said only the first half. "Not covered here"
+// told a reader what zae would not do without ever telling them what runs, so
+// the question it raised — *then what IS in charge?* — had to be answered
+// somewhere else, with cluster access the reader may not have.
+func renderController(w io.Writer, title string, c *Controller) {
+	fmt.Fprintln(w, title)
+	if !c.reported() {
+		fmt.Fprintf(w, "  %s\n", controllerUnreported)
+		fmt.Fprintln(w, updatedOutside(SourceUnknown))
+		return
+	}
+	label(w, "version", dash(controllerVersion(c)))
+	label(w, "image", dash(c.Image))
+	label(w, "installed", installedBy(c.Source))
+	label(w, "update", controllerUpdateLine(c))
+	if strings.TrimSpace(c.ObservedAt) != "" {
+		label(w, "observed", c.ObservedAt)
+	}
+	fmt.Fprintln(w, updatedOutside(c.Source))
+}
+
+// controllerVersion names the build: what the operator reported, else what its
+// image says. The portal fills this in; the fallback is for anything else that
+// answers this API and does not.
+func controllerVersion(c *Controller) string {
+	if v := strings.TrimSpace(c.Version); v != "" {
+		return v
+	}
+	if v := tagOrDigest(c.Image); v != "" {
+		return v
+	}
+	return SourceUnknown
+}
+
+// controllerUpdateLine says whether something newer was found — and never what
+// to do about it, because that is the next line's job and it is not a command.
+func controllerUpdateLine(c *Controller) string {
+	up := strings.TrimSpace(c.AvailableUpdate)
+	switch {
+	case up == "":
+		// Not "none": an operator installed from a manifest may never look,
+		// and "none offered" would be a claim about a check that never ran.
+		return "none reported"
+	case up == controllerVersion(c):
+		return up + " — already running"
+	}
+	return up + " available"
+}
+
+// installedBy names how the controller got here, for the "installed" row.
+func installedBy(source string) string {
+	switch strings.TrimSpace(source) {
+	case SourceOLM:
+		return "OLM — a subscription the cluster manages"
+	case SourceManifest:
+		return "its install manifest"
+	case SourceAppliance:
+		return "the appliance"
+	case "", SourceUnknown:
+		return "not reported"
+	default:
+		return source
+	}
+}
+
+// updatedOutside is the one line the section exists for: what updates the
+// controller, given how it was installed. Each source sends a reader somewhere
+// different, which is why the operator reports the source at all — and none of
+// them is a thing zae can do, which is why this is a sentence and not a flag.
+func updatedOutside(source string) string {
+	const prefix = "Updated outside the platform: "
+	switch strings.TrimSpace(source) {
+	case SourceOLM:
+		return prefix + "approve the update in its OLM subscription."
+	case SourceManifest:
+		return prefix + "apply the pinned install manifest, usually through the deployment repository that holds it."
+	case SourceAppliance:
+		return prefix + "update the appliance — its own update carries the controller."
+	case "", SourceUnknown:
+		return prefix + "update it where it was installed from — an OLM subscription, the install manifest, or the appliance."
+	default:
+		return prefix + fmt.Sprintf("update it where it was installed from (%s).", source)
+	}
 }
 
 // renderWorkloads prints the workload table: what the operator renders first,
@@ -96,9 +185,24 @@ func groupLabel(w Workload) string {
 // digest. A reference with neither is pulled as :latest, which is what the
 // column then says, because that is what will run.
 func imageTag(image string) string {
+	if strings.TrimSpace(image) == "" {
+		return "-"
+	}
+	if v := tagOrDigest(image); v != "" {
+		return v
+	}
+	return "latest"
+}
+
+// tagOrDigest is the part of a reference that identifies the build — the tag,
+// or the head of the digest — and "" when it carries neither. The distinction
+// matters twice: a workload with neither is pulled as :latest, which is what
+// its column says; a CONTROLLER with neither cannot be identified at all, and
+// saying "latest" there would name a build nobody can look up.
+func tagOrDigest(image string) string {
 	image = strings.TrimSpace(image)
 	if image == "" {
-		return "-"
+		return ""
 	}
 	if at := strings.LastIndex(image, "@"); at >= 0 {
 		d := image[at+1:]
@@ -114,7 +218,7 @@ func imageTag(image string) string {
 	if _, tag, ok := strings.Cut(name, ":"); ok && tag != "" {
 		return tag
 	}
-	return "latest"
+	return ""
 }
 
 // versionLine says what the platform was pinned to, or that nothing is pinned

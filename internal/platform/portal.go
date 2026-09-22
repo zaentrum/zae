@@ -83,8 +83,56 @@ type Operator struct {
 	// 0 against a portal that predates them.
 	Generation         int64 `json:"generation"`
 	ObservedGeneration int64 `json:"observedGeneration"`
+	// Controller is the operator's OWN controller, when the instance reports
+	// it. A pointer because its absence is the answer for every operator older
+	// than the field — a different thing from reporting blanks, and zae says
+	// so in different words.
+	Controller *Controller `json:"controller"`
 	// Note says why there is nothing to report, when Present is false.
 	Note string `json:"note"`
+}
+
+// Controller is what reconciles the resource this package drives — the
+// operator's own controller image, not anything the platform runs.
+//
+// zae reports it and never changes it, which is the same boundary this command
+// group has always had, now with the facts on the near side of it: the
+// controller runs in its own namespace, outside the portal's permissions, and
+// is installed and upgraded outside the product. Knowing WHICH build is in
+// charge is what an administrator needs when a reconcile does something the CR
+// does not explain; performing the upgrade is somebody else's step, and this
+// CLI names it rather than pretending to it.
+type Controller struct {
+	// Image is what the controller pod runs, tag or digest.
+	Image string `json:"image"`
+	// Version is the tag, else the short digest, else "unknown".
+	Version string `json:"version"`
+	// Source is how it was installed: olm | manifest | appliance | unknown.
+	Source string `json:"source"`
+	// AvailableUpdate is a newer version found on the channel, "" when there
+	// is none or nothing looks for one.
+	AvailableUpdate string `json:"availableUpdate"`
+	// ObservedAt is when the operator last looked.
+	ObservedAt string `json:"observedAt"`
+}
+
+// Install sources. Each one names a different thing to go and do, which is the
+// only reason the operator reports the source at all.
+const (
+	SourceOLM       = "olm"
+	SourceManifest  = "manifest"
+	SourceAppliance = "appliance"
+	SourceUnknown   = "unknown"
+)
+
+// reported answers whether there is anything to print. An operator that
+// predates the field sends nothing; one may send the object with nothing in
+// it. Both mean the same to a reader, and neither is a row of dashes.
+func (c *Controller) reported() bool {
+	if c == nil {
+		return false
+	}
+	return strings.TrimSpace(c.Image+c.Version+c.Source+c.AvailableUpdate+c.ObservedAt) != ""
 }
 
 // Component is one workload as the operator's own status lists it.
@@ -422,6 +470,24 @@ func (c *client) console(ctx context.Context) (*Console, json.RawMessage, error)
 			msg: fmt.Sprintf("undetermined: read the platform: %s answered with JSON that is not the operator console's (%v)", c.base, err)}
 	}
 	return &cons, raw, nil
+}
+
+// controllerDoc pulls operator.controller out of the console document for
+// --json: a script reads the API's shape, not zae's view of it. It is always
+// an object, so `.version` is addressed the same way against an instance that
+// reports no controller as against one that does.
+func controllerDoc(raw json.RawMessage) string {
+	var doc struct {
+		Operator struct {
+			Controller json.RawMessage `json:"controller"`
+		} `json:"operator"`
+	}
+	if json.Unmarshal(raw, &doc) == nil {
+		if s := strings.TrimSpace(string(doc.Operator.Controller)); s != "" && s != "null" {
+			return s
+		}
+	}
+	return "{}"
 }
 
 // excerpt is the instance's own message, trimmed for one line. portal-api

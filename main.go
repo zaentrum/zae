@@ -49,6 +49,7 @@ Usage:
   zae addon add <chart> --url https://… [flags]    plan an addon from a Helm chart, confirm, install
   zae addon list|status|upgrade|remove …           manage addons installed from charts ('zae addon help')
   zae platform status --url https://…              the platform's version, update and workloads
+  zae platform controller --url https://…          the operator's own controller, and what updates it
   zae platform update|restart|scale …              drive platform updates ('zae platform help')
   zae <service> <command> --url https://… [--arg k=v] [--query k=v] [--data JSON]
   zae version

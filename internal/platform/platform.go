@@ -56,6 +56,7 @@ func usage(w io.Writer) {
 
 Usage:
   zae platform status --url https://… [--json]
+  zae platform controller --url https://… [--json]
   zae platform update --url https://… [--version V] [--channel C] [--mode auto|manual]
       [--apply] [--yes] [--wait] [--timeout 10m]
   zae platform restart <workload> --url https://… [--yes] [--wait] [--timeout 10m]
@@ -65,7 +66,17 @@ status shows the version the platform is pinned to — or that nothing is
 pinned and it follows a channel — the channel, the update mode, the phase, the
 version it reports running and whether an update is offered; then every
 workload: the ones the operator renders first, addons after them, and whatever
-neither claims last.
+neither claims last; and last the operator's own controller.
+
+controller is that last section on its own, for scripts: the version in
+charge, the image it runs, how it was installed, and whether something newer
+was found. There is no command that updates it, and there is not meant to be —
+the controller runs in its own namespace, outside the one the portal
+administers, and is updated where it was installed from: an OLM subscription,
+the pinned install manifest (usually through the deployment repository that
+holds it), or the appliance's own update. status and controller both name the
+path for the source the operator reports. An operator that reports no
+controller says so, and exits 3.
 
 update changes what the platform asks for. --version pins an image tag
 ('latest' follows the channel again), --channel picks the release train,
@@ -86,15 +97,15 @@ it does the counters describe the old pod at exactly the size asked for.
 Against an instance whose portal-api reports less than that, zae names what it
 cannot see and falls back to a readiness gate.
 
-This does not update the operator's own controller image: the controller runs
-outside the namespace the portal administers. Apply its install bundle for
-that — or use OLM, where the cluster installs it that way.
+Nothing here updates the operator's own controller. update, restart and scale
+change the platform that controller deploys, which is the other half of the
+same job and the half that happens far more often.
 
 Needs the platform's admin role: sign in with 'zae login --url …', or carry a
 bearer in ZAE_TOKEN (which wins when it is set).
 Exit codes: 0 done · 1 the instance refused it, the change was declined, or it
-was not ready in time · 2 usage · 3 this instance has no operator console, or
-no such workload · 4 undetermined · 5 forbidden.
+was not ready in time · 2 usage · 3 this instance has no operator console, no
+such workload, or no controller reported · 4 undetermined · 5 forbidden.
 `)
 }
 
@@ -119,6 +130,8 @@ func Run(args []string) int {
 	switch args[0] {
 	case "status":
 		return status(args[1:])
+	case "controller":
+		return controller(args[1:])
 	case "update":
 		return update(args[1:])
 	case "restart":
@@ -129,7 +142,7 @@ func Run(args []string) int {
 		usage(stdout)
 		return exitcode.OK
 	default:
-		errf("usage: zae platform has no command %q — status, update, restart, scale", args[0])
+		errf("usage: zae platform has no command %q — status, controller, update, restart, scale", args[0])
 		return exitcode.Usage
 	}
 }
@@ -251,6 +264,56 @@ func status(args []string) int {
 	}
 	if !*asJSON {
 		renderStatus(stdout, base, cons)
+	}
+	return exitcode.OK
+}
+
+// controller prints the operator's own controller on its own — the section a
+// status ends with, for a script that wants only that.
+//
+// There is no command beside it that updates the controller. It is installed
+// and upgraded outside the product, so the useful thing zae can do is say what
+// is in charge, whether something newer exists, and which of the three paths
+// applies here. An instance that cannot say exits 3: not offered by this
+// instance is a state a script can branch on, and it is the truth — the
+// operator predates the field.
+func controller(args []string) int {
+	fs := flagSet("controller")
+	rawURL := fs.String("url", "", "public URL of the instance (required)")
+	asJSON := fs.Bool("json", false, "print the controller as the portal reports it, as JSON")
+	pos, code, ok := parse(fs, args)
+	if !ok {
+		return code
+	}
+	if len(pos) != 0 {
+		// The likeliest thing to type after `controller` is an upgrade. Answer
+		// the question behind it rather than "unknown argument".
+		return usageErr("zae platform controller takes no arguments — it reads the controller, and nothing in zae updates it: approve the update in its OLM subscription, apply the pinned install manifest, or update the appliance, depending on how it was installed")
+	}
+	base, err := instance.Base(*rawURL)
+	if err != nil {
+		return usageErr("%v", err)
+	}
+	cons, raw, cerr := newClient(base).console(context.Background())
+	if cerr != nil {
+		return fail(cerr)
+	}
+	if *asJSON {
+		// The portal's own sub-document, unchanged — and always an object, so
+		// a script addresses .version the same way whether or not there is one.
+		fmt.Fprintln(stdout, controllerDoc(raw))
+	}
+	if !cons.offered() {
+		errf("not offered: %s", cons.noConsole(base))
+		return exitcode.NotOffered
+	}
+	c := cons.Operator.Controller
+	if !*asJSON {
+		renderController(stdout, base+" — "+controllerHeading, c)
+	}
+	if !c.reported() {
+		errf("not offered: %s does not report the operator's controller — its operator predates the field", base)
+		return exitcode.NotOffered
 	}
 	return exitcode.OK
 }
