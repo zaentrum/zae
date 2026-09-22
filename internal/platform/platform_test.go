@@ -609,13 +609,25 @@ func TestStatusNamesTheUpgradePathForEverySource(t *testing.T) {
 
 // What the controller reports about updates is information, never a step: an
 // update on the channel is named, and what applies it is the line after it.
+//
+// Two different facts arrive in that one field, and they cannot share a
+// sentence. A version is a point you are on or are not on. A channel tag is a
+// name that outlives every image it points at — live, an install running
+// :sha-19ea431 against a channel serving :latest read "latest available",
+// which looks like a version number and names nothing to compare against.
 func TestStatusControllerUpdateLine(t *testing.T) {
 	cases := map[string]struct {
 		version, update string
 		want            string
 	}{
 		"something newer":              {"v0.4.1", "v0.5.0", "update       v0.5.0 available"},
+		"a bare semver":                {"1.4.0", "1.5.0", "update       1.5.0 available"},
+		"a pre-release":                {"1.4.0", "2.0.0-rc1", "update       2.0.0-rc1 available"},
 		"the channel offers what runs": {"v0.4.1", "v0.4.1", "update       v0.4.1 — already running"},
+		// The live case: pinned to a commit image, following a moving tag.
+		"a moving channel tag":       {"sha-19ea431", "latest", `update       the "latest" channel now serves a different image`},
+		"any other moving tag":       {"sha-19ea431", "edge", `update       the "edge" channel now serves a different image`},
+		"a channel tag named stable": {"sha-19ea431", "stable", `update       the "stable" channel now serves a different image`},
 		// Not "none offered": an operator installed from a manifest may never
 		// look, and claiming a check that did not run is a lie about a fact.
 		"nothing reported": {"v0.4.1", "", "update       none reported"},
@@ -632,7 +644,31 @@ func TestStatusControllerUpdateLine(t *testing.T) {
 			if strings.Contains(out, "zae platform controller update") {
 				t.Errorf("zae must not offer a command that updates the controller:\n%s", out)
 			}
+			// A moving tag must never be rendered as a version, whichever
+			// branch produced the line.
+			if !versionLike(c.update) && c.update != "" && strings.Contains(out, c.update+" available") {
+				t.Errorf("%q is a channel tag and must not read as a version:\n%s", c.update, out)
+			}
 		})
+	}
+}
+
+// The rule that separates the two wordings, on its own. `v` and a digit is the
+// release convention; dotted numbers are a release too; everything else is a
+// name that outlives the images it points at.
+func TestVersionLike(t *testing.T) {
+	versions := []string{"v0.5.0", "v1", "V2.0.0", "1.5.0", "1.5", "2.0.0-rc1", "1.4.0+build.7"}
+	moving := []string{"latest", "stable", "edge", "main", "nightly", "sha-19ea431", "1", "v", "", "  ",
+		"release-1.5", "latest.1"}
+	for _, v := range versions {
+		if !versionLike(v) {
+			t.Errorf("versionLike(%q) = false, want true", v)
+		}
+	}
+	for _, m := range moving {
+		if versionLike(m) {
+			t.Errorf("versionLike(%q) = true, want false", m)
+		}
 	}
 }
 

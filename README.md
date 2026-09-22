@@ -217,6 +217,11 @@ the platform reports 1.5.0, and every workload the operator manages is ready
   | `appliance` | update the appliance — its own update carries the controller |
   | `unknown` | whichever of the three installed it |
 
+  What the channel serves is worded for what it is: a version reads
+  `v0.5.0 available`, a moving tag reads `the "latest" channel now serves a
+  different image` — an install pinned to a commit image is not "on" `latest`
+  and never will be, so naming the tag as a version says nothing.
+
   There is no flag that does any of them. An operator that reports no
   controller — every operator older than the field — says so, and
   `zae platform controller` exits `3` (not offered by this instance) so a

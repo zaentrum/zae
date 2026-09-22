@@ -82,6 +82,14 @@ func controllerVersion(c *Controller) string {
 
 // controllerUpdateLine says whether something newer was found — and never what
 // to do about it, because that is the next line's job and it is not a command.
+//
+// What was found decides the wording, because two different facts arrive in
+// one field. A version is a thing you can be on or not be on: "v0.5.0
+// available" is a complete statement. A CHANNEL TAG is not — an install
+// running :sha-19ea431 against a channel that serves :latest was rendered as
+// "latest available", which reads as a version number and names nothing a
+// reader can compare themselves against. The tag has not changed and never
+// will; what it points at has. So that case says so instead.
 func controllerUpdateLine(c *Controller) string {
 	up := strings.TrimSpace(c.AvailableUpdate)
 	switch {
@@ -91,8 +99,48 @@ func controllerUpdateLine(c *Controller) string {
 		return "none reported"
 	case up == controllerVersion(c):
 		return up + " — already running"
+	case !versionLike(up):
+		return fmt.Sprintf("the %q channel now serves a different image", up)
 	}
 	return up + " available"
+}
+
+// versionLike reports whether a value names a release rather than a moving
+// tag: `v` and a digit (v0.5.0), or dotted numbers on their own (1.5.0,
+// 2.0.0-rc1). Everything else — latest, stable, edge — is a name that outlives
+// every image it points at, and is worded as one.
+//
+// Two numeric components are enough. A release is what a channel serves, so
+// the question is only ever "is this a fixed point or a moving one", and
+// nothing that reaches here is both.
+func versionLike(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	// A leading v and a digit is the release convention, and settles it.
+	if (s[0] == 'v' || s[0] == 'V') && len(s) > 1 && s[1] >= '0' && s[1] <= '9' {
+		return true
+	}
+	// A pre-release or build suffix does not change what the value is.
+	if i := strings.IndexAny(s, "-+"); i >= 0 {
+		s = s[:i]
+	}
+	parts := strings.Split(s, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	for _, p := range parts {
+		if p == "" {
+			return false
+		}
+		for _, r := range p {
+			if r < '0' || r > '9' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // installedBy names how the controller got here, for the "installed" row.
