@@ -300,18 +300,56 @@ func interrupted() int {
 }
 
 // Logout runs `zae logout --url https://…` or `zae logout --all`.
+//
+// Signing out ends the session where it lives, then forgets it here: the
+// refresh token is revoked at the issuer (RFC 7009, at the endpoint the
+// issuer's metadata names), and the stored entry is removed. Forgetting alone
+// would leave a session that outlives the file it was copied from.
+//
+// The entry is removed whatever the issuer answers: a person who signs out
+// must not be kept signed in by an identity provider that is down or gone.
+// Whether it ended there too is the exit code — 0 it did, 3 the issuer offers
+// no revocation, 4 it could not be asked, 1 it refused — and the message says
+// how long the session lives on when it did not. Ctrl-C before the answer
+// keeps the entry, so the sign-out can be done again.
 func Logout(args []string) int {
 	fs := flag.NewFlagSet("logout", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	rawURL := fs.String("url", "", "instance whose stored session to remove")
-	all := fs.Bool("all", false, "remove every stored session")
+	rawURL := fs.String("url", "", "instance whose session to end and forget")
+	all := fs.Bool("all", false, "end and forget every stored session")
 	if err := fs.Parse(args); err != nil {
 		return exitcode.Usage
 	}
+	ctx, stop := interruptible()
+	defer stop()
 	if *all {
 		if *rawURL != "" {
 			errf("usage: zae logout takes --url or --all, not both")
 			return exitcode.Usage
+		}
+		f, err := creds.Load()
+		if err != nil {
+			// Unreadable, so nothing in it can be revoked: forgetting it is all
+			// there is to do, as it always was.
+			if _, cerr := creds.Clear(); cerr != nil {
+				errf("failed: %v", err)
+				return exitcode.Failed
+			}
+			path, _ := creds.Path()
+			errf("warning: %v — removed it without ending its sessions at their identity providers", err)
+			fmt.Fprintf(stdout, "removed 0 stored session(s); %s is gone\n", path)
+			return exitcode.OK
+		}
+		bases, _ := creds.List()
+		code := exitcode.OK
+		for _, base := range bases {
+			c := endSession(ctx, base, f.Instances[base])
+			if ctx.Err() != nil {
+				return interruptedLogout()
+			}
+			if code == exitcode.OK {
+				code = c
+			}
 		}
 		n, err := creds.Clear()
 		if err != nil {
@@ -320,28 +358,87 @@ func Logout(args []string) int {
 		}
 		path, _ := creds.Path()
 		fmt.Fprintf(stdout, "removed %d stored session(s); %s is gone\n", n, path)
-		return exitcode.OK
+		return code
 	}
 	base, err := instance.Base(*rawURL)
 	if err != nil {
 		errf("usage: %v (or `zae logout --all`)", err)
 		return exitcode.Usage
 	}
-	removed, err := creds.Remove(base)
+	e, ok, err := creds.Get(base)
 	if err != nil {
 		errf("failed: %v", err)
 		return exitcode.Failed
 	}
-	if !removed {
+	if !ok {
 		// Not an error: the end state the caller asked for is the one that holds.
 		fmt.Fprintf(stdout, "no stored session for %s\n", base)
 		return exitcode.OK
+	}
+	code := endSession(ctx, base, e)
+	if ctx.Err() != nil {
+		return interruptedLogout()
+	}
+	if _, err := creds.Remove(base); err != nil {
+		errf("failed: %v", err)
+		return exitcode.Failed
 	}
 	fmt.Fprintf(stdout, "removed the stored session for %s\n", base)
 	if os.Getenv(instance.TokenEnv) != "" {
 		fmt.Fprintf(stdout, "note: %s is still set in this shell, and still wins over a stored session\n", instance.TokenEnv)
 	}
-	return exitcode.OK
+	return code
+}
+
+func interruptedLogout() int {
+	fmt.Fprintln(stdout, "\nstopped; the stored session is kept — run zae logout again to end it")
+	return 130
+}
+
+// endSession revokes a stored session at its issuer and says how that went:
+// on stdout when it ended, on stderr — with how long it lives on — when it did
+// not. It returns the exit code of the outcome.
+//
+// The refresh token is what keeps a session alive, and revoking it ends the
+// session at the issuer; an access token already issued is a bearer the
+// instance checks only until it expires, minutes later. An entry with no
+// refresh token has its access token revoked instead.
+func endSession(ctx context.Context, base string, e creds.Entry) int {
+	token, hint, what := e.RefreshToken, "refresh_token", "refresh token"
+	if token == "" {
+		token, hint, what = e.AccessToken, "access_token", "access token"
+	}
+	issuer := strings.TrimRight(e.Issuer, "/")
+	lives := "it stays valid there until it expires"
+	switch {
+	case token == "":
+		return exitcode.OK // nothing that could still be used
+	case issuer == "":
+		errf("not offered: the session for %s names no identity provider, so it cannot be ended there — %s", base, lives)
+		return exitcode.NotOffered
+	}
+	c := newClient()
+	ep, err := c.Metadata(ctx, issuer)
+	if err == nil {
+		err = c.Revoke(ctx, ep, e.ClientID, token, hint)
+	}
+	var oe *oidc.Error
+	switch {
+	case err == nil:
+		fmt.Fprintf(stdout, "ended the session for %s at %s: its %s is revoked\n", base, issuer, what)
+		return exitcode.OK
+	case ctx.Err() != nil:
+		return 130
+	case errors.Is(err, oidc.ErrNoRevocation):
+		errf("not offered: %s offers no token revocation (no revocation_endpoint in its metadata), so the session for %s cannot be ended there — %s", issuer, base, lives)
+		return exitcode.NotOffered
+	case errors.As(err, &oe):
+		errf("failed: %s refused to revoke the session for %s (%v) — %s; end it from the identity provider's own account page to end it now", issuer, base, err, lives)
+		return exitcode.Failed
+	default:
+		errf("undetermined: could not end the session for %s at %s (%v) — %s; end it from the identity provider's own account page to end it now", base, issuer, err, lives)
+		return exitcode.Undetermined
+	}
 }
 
 // Whoami runs `zae whoami --url https://…`: who the bearer zae would send

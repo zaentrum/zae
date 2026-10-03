@@ -48,6 +48,12 @@ type idp struct {
 	deviceStatus int
 	// noDeviceEndpoint drops device_authorization_endpoint from the metadata.
 	noDeviceEndpoint bool
+	// noRevocation drops revocation_endpoint; revokeStatus and revokeReply
+	// answer a revocation instead of 200.
+	noRevocation bool
+	revokeStatus int
+	revokeReply  string
+	revoked      []url.Values
 
 	polls      int
 	deviceForm url.Values
@@ -65,8 +71,23 @@ func newIDP(t *testing.T, replies ...string) *idp {
 		if p.noDeviceEndpoint {
 			device = ""
 		}
-		fmt.Fprintf(w, `{"issuer":%q,%s"token_endpoint":%q}`,
-			p.srv.URL+realmPrefix, device, p.srv.URL+realmPrefix+"/token")
+		revocation := fmt.Sprintf(`"revocation_endpoint":%q,`, p.srv.URL+realmPrefix+"/revoke")
+		if p.noRevocation {
+			revocation = ""
+		}
+		fmt.Fprintf(w, `{"issuer":%q,%s%s"token_endpoint":%q}`,
+			p.srv.URL+realmPrefix, device, revocation, p.srv.URL+realmPrefix+"/token")
+	})
+	mux.HandleFunc(realmPrefix+"/revoke", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		p.mu.Lock()
+		p.revoked = append(p.revoked, r.PostForm)
+		status, reply := p.revokeStatus, p.revokeReply
+		p.mu.Unlock()
+		if status != 0 {
+			w.WriteHeader(status)
+		}
+		fmt.Fprint(w, reply)
 	})
 	mux.HandleFunc(realmPrefix+"/device", func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
