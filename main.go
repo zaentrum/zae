@@ -6,10 +6,10 @@
 //     speak for itself: preflight and outside-in diagnosis (doctor, which
 //     with --sign-in also uses the platform the way a person does — the check
 //     the platform runs on itself after every update), signing in (login),
-//     adding addons from a chart (addon). These ship in the binary
-//     because a service can only extend the CLI once it is running, and the
-//     moments you need doctor most are the moments nothing is. An addon
-//     cannot declare the command that installs it.
+//     adding addons (addon), reading the platform's logs (debug). These ship
+//     in the binary because a service can only extend the CLI once it is
+//     running, and the moments you need doctor most are the moments nothing
+//     is. An addon cannot declare the command that installs it.
 //   - a DISCOVERED surface — every service and addon will declare commands,
 //     checks and topics in a capability descriptor; the instance aggregates
 //     them and zae renders them at runtime. Installing an addon extends the
@@ -44,8 +44,8 @@ func usage() {
 
 Usage:
   zae login --url https://your-instance.example    sign in (device flow, opens a browser)
-  zae logout --url https://… | --all               forget a stored session
-  zae whoami --url https://…                       who zae's bearer says you are
+  zae logout --url https://… | --all               end a session at its issuer, and forget it
+  zae whoami --url https://…                       who the instance says zae's bearer is
   zae doctor --url https://your-instance.example   outside-in health of an instance
   zae doctor --url https://… --sign-in [--report FILE]
                                                    …then signed in as a person, read-only
@@ -53,7 +53,8 @@ Usage:
   zae discover --url https://…                     show the instance's capability surface
   zae require <service>[.<command>] --url https://… assert the instance offers it (exit 0/3/4/6, silent)
   zae addon add <chart> --url https://… [flags]    plan an addon from a Helm chart, confirm, install
-  zae addon list|status|upgrade|remove …           manage addons installed from charts ('zae addon help')
+  zae addon add http://<service> --url https://…   check an addon by its address, confirm, add it
+  zae addon list|status|upgrade|refresh|remove …   manage installed addons ('zae addon help')
   zae platform status --url https://…              the platform's version, update and workloads
   zae platform controller --url https://…          the operator's own controller, and what updates it
   zae platform update|restart|scale …              drive platform updates ('zae platform help')

@@ -2,7 +2,8 @@
 
 `zae` talks to a [zaentrum](https://github.com/zaentrum/zaentrum) instance from
 where you stand: it validates an installation outside-in, adds addons from
-their Helm charts, and grows its command surface **from the instance itself**.
+their Helm charts or by their address, drives the platform's updates, reads
+its logs and events, and grows its command surface **from the instance itself**.
 
 ```
 $ zae doctor --url https://media.example.org
@@ -58,7 +59,8 @@ The binary splits in two, and the split is the point:
   visible — and anonymous registry pullability). Each check ends in a `fix:`
   line; a diagnostic that only says "degraded" makes you do the diagnosis.
   `addon` is static for the same reason: an addon cannot declare the command
-  that installs it.
+  that installs it. So is `debug`: a platform's logs are read when something
+  is wrong with it.
 - **Discovered surface** — services and addons declare commands, checks and
   topics in capability descriptors; the instance aggregates them and `zae`
   renders them at runtime. Installing an addon extends the CLI; uninstalling
@@ -185,10 +187,12 @@ installing example — follow it with zae addon status example --url https://med
 | command | does |
 |---|---|
 | `zae addon add <chart> --url …` | creates the addon suspended, prints the operator's plan for exactly that write, asks, installs. `<chart>` is `oci://…` with `--version` (or `:tag`), or an `https://` link to a chart archive; `--digest sha256:…` pins the archive; `--name` overrides the name taken from the reference, which zae derives exactly as the portal does |
-| `zae addon list --url …` | every installed addon: chart or address, the version asked for next to the one running, phase, ready components |
-| `zae addon status <name> --url …` | phase, the chart asked for and the one running, registration, components and the current plan |
+| `zae addon add http://<service> --url …` | an addon deployed some other way, by its in-cluster address — see [below](#addons-added-by-their-address): checks what adding it does, prints it, asks, installs |
+| `zae addon list --url …` | every installed addon: chart or address, the version the addon reports, a chart addon's chart version (asked for, and running when that differs), phase, ready components, and whether a refresh waits |
+| `zae addon status <name> --url …` | a chart addon: phase, the chart asked for and the one running, registration, components and the current plan. An address addon: its address, version, whether a refresh waits, its containers and its setup |
 | `zae addon upgrade <name> --url …` | changes the chart (`--version`, `--chart`, `--digest`), values (`--set`, `--values`) or secret inputs (the secret flags, `--clear-secret`); plans first, shows the changes, asks, installs |
-| `zae addon remove <name> --url …` | deletes the addon and everything its chart applied; `--keep-values` keeps its values Secrets and its generated values for a later install |
+| `zae addon refresh <name> --url …` | reads an address addon's manifest again after it was redeployed — checked, shown, asked |
+| `zae addon remove <name> --url …` | deletes the addon and everything its chart applied; `--keep-values` keeps its values Secrets and its generated values for a later install. An address addon loses what the portal created for it; its containers keep running |
 
 - **Nothing blocked is installed.** A plan the guardrails refused, or whose
   values fail the chart's `values.schema.json`, exits `1` — `--yes` included.
@@ -232,6 +236,58 @@ installing example — follow it with zae addon status example --url https://med
   cluster without the resource); `4` that the instance could not be reached;
   `5` a missing or refused admin bearer; `130`/`143` interrupted.
 
+### Addons added by their address
+
+An addon deployed some other way — its own chart, a manifest, a deployment
+repository — is added by its in-cluster address: the Service of its primary
+container. The portal reads the capability manifest it serves and creates what
+it declares — its app, tiles, slot rows and CLI commands — under the addon's
+key. It neither deploys such an addon nor deletes it.
+
+```
+$ zae addon add http://sample-addon --url https://media.example.org
+check sample — Sample addon 1.2.0
+  status      not installed yet
+  address     http://sample-addon
+  creates     1 tile, 1 slot row, 2 CLI commands, 1 container
+  containers
+    sample  primary  sample-addon  ready  1/1  serves the sample
+install sample on https://media.example.org? [y/N] y
+installed sample: 1 tile, 1 slot row, 2 CLI commands, 1 container
+```
+
+- **Checked first, always** — the console's "check": the portal answers what
+  installing would do and writes nothing, zae prints it and asks, like every
+  other write. `--dry-run` stops after the check, and `--json` prints the
+  portal's answer to it. A portal-api older than the check installs when asked
+  to check; zae says so, and a `--dry-run` that wrote exits `1`.
+- **A move needs consent.** An addon installed from another address moves only
+  with `--replace-address`: the portal's proxy then sends every request for
+  it, with its caller's token, to the new address. Without the flag zae stops
+  before writing.
+- **`--space`** picks the launchpad space its tiles go to, unless the addon
+  brings its own; a space the launchpad does not have is exit `3`, naming the
+  ones it has. The portal keeps no record of the space an addon was added to,
+  so `refresh` places its tiles in the first space unless `--space` names
+  another — and says so.
+- **`refresh`** reads the manifest again from the address the portal recorded,
+  after the same check: `list` says `available` in its REFRESH column when the
+  addon serves another manifest than the one installed. A chart addon is
+  registered again by the portal itself; refreshing one is a usage error that
+  names `upgrade`.
+- **`status`** asks the chart API first and, when it has no addon by that name,
+  reads the addons list: where it was added from, the version its manifest
+  reports, what it registers, its containers with their live state, and its
+  setup — asked of the addon itself through the portal's app proxy, as the
+  console does. `--json` prints the list's row for it.
+- **`remove`** says the platform does not delete containers, and repeats what
+  the portal says still runs.
+- `http://` is an address — charts are fetched over https only, and a link to
+  a chart archive over http is refused as one — and so is an `https://` URL
+  without a path. The portal's refusals reach the terminal in its words: a
+  chart addon by that name, a manifest that breaks the contract, an address
+  that does not answer (`1`); its workloads unlisted for a moment (`4`).
+
 ## The platform's own updates — `zae platform`
 
 An instance managed by the zaentrum operator declares the whole platform in one
@@ -249,7 +305,7 @@ https://media.example.org — the platform
   phase        Ready
   running      1.4.0
   update       1.5.0 available — apply it with: zae platform update --apply --url https://media.example.org
-  verified     passed 21/22, 1 skipped · 3 min ago · after the update to 1.4.0 (image set 3f9a1c0b2d4e)
+  verified     passed 21/22, 1 skipped · 3 min ago · after the update to 1.4.0 (image set 3f9a1c0b2d4e) · job zaentrum-verify-7f3c
   host         media.example.org
 
 NAME            GROUP          IMAGE                READY  PHASE     REASON
@@ -281,22 +337,25 @@ the platform reports 1.5.0, and every workload the operator manages is ready
 
 | command | does |
 |---|---|
-| `zae platform status --url …` | the version the platform is pinned to — or that nothing is pinned and it follows a channel — the channel, the update mode, the phase, the version it reports running, whether an update is offered; then every workload, grouped: what the operator renders, then addons, then whatever neither claims; then the operator's own controller. `--json` prints the portal's own document |
+| `zae platform status --url …` | the version the platform is pinned to — or that nothing is pinned and it follows a channel — the channel, the update mode, the phase, the version it reports running, whether an update is offered; then every workload, grouped: what the operator renders, then addons, then whatever neither claims; then the operator's own controller. Without an operator, the workloads alone ([direct mode](#direct-mode)). `--json` prints the portal's own document |
 | `zae platform controller --url …` | that last section on its own, for scripts: the version in charge, its image, how it was installed, whether something newer was found — and the one line naming what updates it. `--json` prints the portal's own `controller` document, always an object |
 | `zae platform update --url …` | `--version V` pins an image tag (`--version latest` follows the channel again), `--channel C` picks the release train, `--mode auto\|manual` decides whether the operator updates itself, `--apply` pins the update it has already discovered |
 | `zae platform restart <workload> --url …` | rolls one workload |
 | `zae platform scale <workload> <replicas> --url …` | sets one workload's replica count |
 | `zae platform verify --url …` | asks the operator to verify the platform now; `--wait` follows the run this request started and prints its checks |
 
+- **What the resource leaves unset reads as what the operator does** — the
+  console's values: an unset update mode is `manual`, an unset channel
+  `stable`, each marked as the default rather than shown as `-`.
 - **The platform verifies itself.** After every rollout the operator runs
   `zae doctor --sign-in` in the platform's namespace as a test account it
   created, and records the result; `status` shows it on the `verified` line —
-  `passed 14/14 · 3 min ago · after the update to 1.5.0 (image set …)`, or
-  `FAILED 2 of 14 checks` with each failing check under it, `running`,
+  `passed 14/14 · 3 min ago · after the update to 1.5.0 (image set …) · job …`,
+  or `FAILED 2 of 14 checks` with each failing check under it, `running`,
   `error` with the operator's message, `skipped`, `never`, or `off` when
   `spec.verification.enabled` is false. The image set is the fingerprint of the
   images verified, so a run after an update to `latest` still names what it
-  checked.
+  checked; the job is the run itself, whose log `zae debug logs <job>` reads.
 - **`verify` asks, and follows its own run.** A request that is already
   waiting is joined, not doubled. `--wait` ends on the result of the run that
   answers *this* request — a run for an earlier one may finish first and does
@@ -355,9 +414,67 @@ the platform reports 1.5.0, and every workload the operator manages is ready
   pod count separates them — `2` during the surge, `1` once the old pod is
   gone. Against a portal-api that reports less than this, zae names the field
   it cannot see and falls back to the weaker readiness gate.
-- Exit codes follow the contract below: `3` means this instance has no
-  operator console — it is not running where it can manage workloads, or it
-  has no operator resource — or that no workload has that name.
+- <a id="direct-mode"></a>**Direct mode.** A portal in a cluster without an
+  operator resource still manages the workloads — the console calls it direct
+  mode — and restarts and scales the Deployments themselves. So does zae:
+  `status` shows the workloads under the portal's note, and `restart` and
+  `scale` (with `--wait`) work as they do with an operator. What only the
+  operator's resource holds — `update`, `verify`, `controller` — exits `3`,
+  saying it is direct mode.
+- Exit codes follow the contract below: `3` means this instance does not manage
+  its workloads at all (it is not running in a cluster), has no operator for
+  what needs one, or runs no workload by that name.
+
+## The debug console — `zae debug`
+
+The portal's debug console reads every container's log, the platform's event
+bus and a support bundle for a bug report. `zae debug` reads the same, over the
+same read-only, admin-only API (`GET /api/portal/debug/…`) — no cluster
+credentials, no kubectl:
+
+```
+$ zae debug logs example-worker --url https://media.example.org --tail 2
+[example-worker-7d79fd4c4b-xprff/app] 2026-10-03T22:24:15.287074864Z picked up job 4211
+[example-worker-7d79fd4c4b-qfmtj/app] 2026-10-03T22:24:23.819406222Z picked up job 4212
+[example-worker-7d79fd4c4b-xprff/app] 2026-10-03T22:24:34.302172610Z job 4211 done in 19.0s
+[example-worker-7d79fd4c4b-qfmtj/app] 2026-10-03T22:24:41.024273539Z job 4212 done in 17.2s
+
+$ zae debug events --url https://media.example.org --topic platform.item.added
+TIME                  TOPIC                TYPE   ITEM    AT
+2026-10-03T12:00:01Z  platform.item.added  added  item-1  p0·7
+```
+
+| command | does |
+|---|---|
+| `zae debug logs <workload\|pod> --url …` | a workload's container logs — every pod, every container unless `--container C` picks one — merged by time, each line with `[pod/container]` when there is more than one. `--tail N` per container (the portal's default 500, its most 5000), `--since 10m`, `--follow`, `--json` (one object per line) |
+| `zae debug events --url …` | what the portal's event tap read from the bus since portal-api started — at most the last 500 — oldest first; `--topic`, `--limit`, `--payload`, `--json` (the portal's document, newest first) |
+| `zae debug bundle -o FILE --url …` | the portal's support bundle — workloads and operator state, every container's recent log, the bus topology, the registry, the non-secret settings — plus a section about this zae, to a new file (mode `0600`) or with `-o -` to stdout; `--without logs,kafka,…` leaves sections out |
+
+- **Redacted twice.** The portal scrubs credentials out of every debug view;
+  zae scrubs what it prints or writes again, with the portal's own rules, so a
+  portal-api older than a fix to them — or a field it does not scrub, like an
+  event's key — still does not put a credential in a terminal or a file. JSON
+  is redacted value by value and stays JSON.
+- **A workload's pods are found by their names.** The portal lists pods
+  without their owners, so zae reads the names Kubernetes gives them —
+  `<name>-<template hash>-<suffix>` for a Deployment's, `<name>-<suffix>` for
+  a Job's or a DaemonSet's, `<name>-<ordinal>` for a StatefulSet's — with the
+  generated parts in Kubernetes' own alphabet, which keeps `chino-api` from
+  claiming `chino-api-worker`'s pods. A pod's own name works too, and so does a
+  verification's job, as `status` names it.
+- **`--follow` reads again every two seconds,** as the console's live view
+  does: each read asks for the window since the last one, widened by five
+  seconds, and prints only the lines newer than the newest it printed — told
+  apart by the cluster's nanosecond timestamps. It lists the pods again every
+  round, so a rollout's new pods are read from their first line and the
+  retired ones are said to be gone. A failure that passes is said once; a
+  refused bearer ends it with `5`; Ctrl-C with `130`.
+- **The bundle is never written over a file,** and the portal takes up to a
+  minute to assemble it, which zae waits out.
+- Exit codes: `3` for what is not there, saying what is — no such workload,
+  container or topic, no event bus, no pods outside a cluster; `5` without the
+  admin role; `4` when the instance cannot be reached; `1` when a container
+  cannot be read, after printing the ones that could.
 
 ## Signing in — `zae login`
 
@@ -374,7 +491,7 @@ waiting for you to finish in the browser (Ctrl-C to stop) …
 
 signed in to https://media.example.org
   as         ada (8b1f-…)
-  admin role yes — the token carries "zaentrum-admin"
+  admin role yes — the instance grants this bearer its admin role ("zaentrum-admin")
   expires    Mon, 21 Sep 2026 21:48:23 CEST
              renewed automatically while the session lives
   stored in  /home/ada/.config/zae/credentials.json
@@ -396,8 +513,8 @@ string concatenation, because a realm may be served under a path prefix.
 | command | does |
 |---|---|
 | `zae login --url …` | signs in and stores the session. `--no-browser` prints the URL instead of opening one; `--issuer` and `--client-id` sign in to an instance that does not advertise them; `--scope` overrides the requested scopes |
-| `zae logout --url …` | forgets that instance's session; `--all` removes the file |
-| `zae whoami --url …` | subject, username, and whether the token carries the platform's admin role (`--role` names another). It never prints the token |
+| `zae logout --url …` | ends that instance's session at its identity provider, then forgets it; `--all` does so for every one and removes the file |
+| `zae whoami --url …` | who the instance says the bearer is: username, roles, and whether it grants the bearer its admin role (`--role R` adds whether it lists R); `--json`. It never prints the token |
 
 **Where credentials live.** `~/.config/zae/credentials.json`
 (`$XDG_CONFIG_HOME/zae/credentials.json` when that is set), mode `0600` in a
@@ -417,6 +534,25 @@ If the renewal fails, the session ended: `zae` says *session expired — run:
 zae login --url …* and exits `5` rather than sending a token it knows is dead.
 A token that is real but lacks the role is a different message, because it
 needs a different fix: signing in again with the same account changes nothing.
+
+**Signing out ends the session where it lives.** `zae logout` revokes the
+refresh token at the issuer — the revocation endpoint its metadata names
+([RFC 7009](https://www.rfc-editor.org/rfc/rfc7009)) — and then removes the
+stored entry; forgetting alone would leave a session that outlives the file it
+was copied from. The entry goes whatever the issuer answers, so nobody stays
+signed in because an identity provider is down, and the exit code says whether
+the session ended there too: `0` it did, `3` the issuer offers no revocation,
+`4` it could not be asked, `1` it refused — each with how long the session
+lives on. An access token already issued stays valid until it expires, minutes
+later.
+
+**Who decides the admin role.** The instance: its admin role is a setting, and
+a portal may take it only on tokens issued to its own clients. `whoami` and
+`login` therefore ask (`GET /api/portal/me`) instead of reading a role name
+out of the token — a token can carry the role and still be refused, and
+whoami says why. Against a portal-api that cannot say, they read the token as
+before and say that they did; an instance that cannot be asked is exit `4`,
+one that refuses the bearer `5`.
 
 **Tokens are never printed.** Not by `login`, not by `whoami`, not in an error
 message — the one rule that keeps them out of scrollback, CI logs and pasted
@@ -473,8 +609,11 @@ still wins, for service accounts and CI.
 | Instance-side capability discovery (`/api/portal/cli/discovery`) | ✅ served by portal-api; acquire is the first service declaring itself (10 commands) |
 | Running discovered commands, with the exit-code contract and `zae require` | ✅ v0.2 |
 | `zae addon add/list/status/upgrade/remove` (charts installed by the operator) | 🔶 built against the addon chart API; needs an instance whose portal-api and operator ship it |
+| Addons added by their address: `zae addon add http://…`, `refresh`, and them in `list`/`status`/`remove` | ✅ `list` and `status` run against a live instance; the writes are built against the portal's address-addon API (`POST`/`DELETE /api/portal/addons`) |
 | `zae platform status/controller/update/restart/scale` (the operator console) | 🔶 built against the portal's operator console; needs an operator-managed instance — an older portal-api works, with a weaker `--wait` that says so. `controller` shows what is in charge and names where it is updated; updating it is out of scope by design |
-| `zae login` / `logout` / `whoami` (device grant with PKCE, refresh, per-instance sessions) | 🔶 built; needs a portal-api that advertises `auth` and an operator-created public client |
+| `zae platform` in direct mode (no operator resource) | 🔶 built against the portal's operator console, as the console behaves without an operator |
+| `zae login` / `logout` / `whoami` (device grant with PKCE, refresh, per-instance sessions) | 🔶 built; needs a portal-api that advertises `auth` and an operator-created public client. `whoami` asking the instance runs against a live one; `logout` revoking at the issuer (RFC 7009) is built against the issuer's metadata |
+| `zae debug logs` / `events` / `bundle` (the portal's debug console) | ✅ `logs` (with `--follow`) and `events` run against a live instance; `bundle` is built against the portal's support bundle |
 | Registered checks, `events tail`, journey smoke tests, `addon lint` | 🧭 next — discovery and login are in place |
 
 The platform-side design lives in the zaentrum docs:
