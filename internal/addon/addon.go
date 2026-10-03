@@ -59,6 +59,8 @@ Usage:
       [--values FILE|-] [--set path=value]…
       [--set-secret path[=value]]… [--set-secret-file path=FILE]… [--secret-values FILE|-]
       [--secret-ref path=name[/key]]… [--yes] [--wait] [--timeout 5m]
+  zae addon add http://<service> --url https://… [--space S] [--replace-address]
+      [--dry-run [--json]] [--yes]
   zae addon list --url https://… [--json]
   zae addon status <name> --url https://… [--json]
   zae addon upgrade <name> --url https://… [--version V | --chart REF] [--digest sha256:…]
@@ -72,9 +74,14 @@ the operator's plan — chart, workloads, images, ports, refusals, missing
 inputs — and ask before installing. --yes skips the question; without a
 terminal on stdin it is required.
 
-list, status and remove also know the addons deployed some other way and
-added by their in-cluster address: the portal registers what their manifest
-declares, and neither deploys nor deletes their containers.
+An addon deployed some other way is added by its in-cluster address — the
+Service of its primary container, http://<service>: the portal reads the
+manifest it serves and creates what it declares. add checks first and shows
+what that is; --dry-run stops there. --space picks the launchpad space its
+tiles go to, unless it brings its own. An addon installed from another
+address moves only with --replace-address: the portal's proxy then sends its
+requests, with their callers' tokens, to the new one. The platform
+neither deploys nor deletes these addons' containers.
 
 Values: --values is one JSON object (a file, or - for stdin); --set path=value
 sets one value, JSON when it parses as JSON and a string otherwise
@@ -94,7 +101,7 @@ They add to the secret inputs already set; --clear-secret path removes one.
 Needs the platform's admin role: sign in with 'zae login --url …', or carry a
 bearer in ZAE_TOKEN (which wins when it is set).
 Exit codes: 0 done · 1 refused, failed, declined or not Ready in time · 2 usage ·
-3 no such addon, or the instance cannot install addons from charts ·
+3 no such addon or space, or the instance cannot install addons from charts ·
 4 undetermined · 5 forbidden · 130/143 interrupted (an upgrade is put back first).
 `)
 }
@@ -155,6 +162,13 @@ func Run(args []string) int {
 		errf("usage: zae addon has no command %q — add, list, status, upgrade, remove", args[0])
 		return exitcode.Usage
 	}
+}
+
+// visited names the flags actually given.
+func visited(fs *flag.FlagSet) map[string]bool {
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	return set
 }
 
 // multiFlag collects a repeatable flag.
@@ -253,16 +267,29 @@ func add(args []string) int {
 	yes := fs.Bool("yes", false, "install without asking")
 	wait := fs.Bool("wait", false, "after installing, wait until the addon is Ready and registered")
 	timeout := fs.Duration("timeout", defaultTimeout, "how long each wait lasts: for the plan, and with --wait for Ready")
+	dryRun := fs.Bool("dry-run", false, "an addon's address: show what adding it would do, and write nothing")
+	space := fs.String("space", "", "an addon's address: the launchpad space its tiles go to, unless it brings its own (default: the first space)")
+	replace := fs.Bool("replace-address", false, "an addon's address: move an addon installed from another address to this one")
+	asJSON := fs.Bool("json", false, "with --dry-run: print the portal's answer as JSON")
 	pos, code, ok := parse(fs, args)
 	if !ok {
 		return code
 	}
 	if len(pos) != 1 {
-		return usageErr("zae addon add <chart> --url https://… takes one chart reference")
+		return usageErr("zae addon add <chart|address> --url https://… takes one chart reference or address")
 	}
 	base, err := instance.Base(*rawURL)
 	if err != nil {
 		return usageErr("%v", err)
+	}
+	set := visited(fs)
+	if isAddress(pos[0]) {
+		return addAddress(s, base, pos[0], set, *space, *dryRun, *replace, *yes, *asJSON)
+	}
+	for _, f := range addressOnly {
+		if set[f] {
+			return usageErr("--%s applies to an addon added by its address (http://<service>); a chart is always planned first, and nothing is installed until you answer yes", f)
+		}
 	}
 	chart, err := parseChart(pos[0], *version)
 	if err != nil {
