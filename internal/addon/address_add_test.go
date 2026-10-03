@@ -172,19 +172,23 @@ func TestAddByAddressUsage(t *testing.T) {
 	f, srv := newAddresses(t)
 	chart := "oci://ghcr.io/example/charts/example:1.2.0"
 	for name, args := range map[string][]string{
-		"a version for an address":  {"add", "http://sample-addon", "--version", "1.2.0", "--url", srv.URL, "--yes"},
-		"values for an address":     {"add", "http://sample-addon", "--set", "a=1", "--url", srv.URL, "--yes"},
-		"a wait for an address":     {"add", "http://sample-addon", "--wait", "--url", srv.URL, "--yes"},
-		"a secret for an address":   {"add", "http://sample-addon", "--set-secret", "a=b", "--url", srv.URL, "--yes"},
-		"a check of a chart":        {"add", chart, "--dry-run", "--url", srv.URL, "--yes"},
-		"a space for a chart":       {"add", chart, "--space", "apps", "--url", srv.URL, "--yes"},
-		"json for an install":       {"add", "http://sample-addon", "--json", "--url", srv.URL, "--yes"},
-		"credentials in an address": {"add", "http://user:pw@sample-addon", "--url", srv.URL, "--yes"},
-		"a query in an address":     {"add", "http://sample-addon?x=1", "--url", srv.URL, "--yes"},
-		"no terminal, no --yes":     {"add", "http://sample-addon", "--url", srv.URL},
-		"an http chart archive":     {"add", "http://example.org/charts/example-1.2.0.tgz", "--url", srv.URL, "--yes"},
-		"remove, not a name":        {"remove", "Sample", "--url", srv.URL, "--yes"},
-		"status, not a name":        {"status", "Sample!", "--url", srv.URL},
+		"a version for an address":    {"add", "http://sample-addon", "--version", "1.2.0", "--url", srv.URL, "--yes"},
+		"values for an address":       {"add", "http://sample-addon", "--set", "a=1", "--url", srv.URL, "--yes"},
+		"a wait for an address":       {"add", "http://sample-addon", "--wait", "--url", srv.URL, "--yes"},
+		"a secret for an address":     {"add", "http://sample-addon", "--set-secret", "a=b", "--url", srv.URL, "--yes"},
+		"a check of a chart":          {"add", chart, "--dry-run", "--url", srv.URL, "--yes"},
+		"a space for a chart":         {"add", chart, "--space", "apps", "--url", srv.URL, "--yes"},
+		"json for an install":         {"add", "http://sample-addon", "--json", "--url", srv.URL, "--yes"},
+		"credentials in an address":   {"add", "http://user:pw@sample-addon", "--url", srv.URL, "--yes"},
+		"a query in an address":       {"add", "http://sample-addon?x=1", "--url", srv.URL, "--yes"},
+		"no terminal, no --yes":       {"add", "http://sample-addon", "--url", srv.URL},
+		"an http chart archive":       {"add", "http://example.org/charts/example-1.2.0.tgz", "--url", srv.URL, "--yes"},
+		"refresh, no terminal":        {"refresh", "sample", "--url", srv.URL},
+		"refresh, two names":          {"refresh", "a", "b", "--url", srv.URL, "--yes"},
+		"refresh, not a name":         {"refresh", "Sample", "--url", srv.URL, "--yes"},
+		"remove, not a name":          {"remove", "Sample", "--url", srv.URL, "--yes"},
+		"status, not a name":          {"status", "Sample!", "--url", srv.URL},
+		"refresh without an instance": {"refresh", "sample", "--yes"},
 	} {
 		if code, _, errs := run(t, "", false, args...); code != exitcode.Usage {
 			t.Errorf("%s: want 2, got %d %q", name, code, errs)
@@ -192,6 +196,48 @@ func TestAddByAddressUsage(t *testing.T) {
 	}
 	if len(f.calls) != 0 {
 		t.Fatalf("usage errors must not reach the portal: %v", f.calls)
+	}
+}
+
+func TestRefreshAnAddonAddedByItsAddress(t *testing.T) {
+	f, srv := newAddresses(t)
+	f.sample("1.1.0")
+	code, out, errs := run(t, "", false, "refresh", "sample", "--url", srv.URL, "--yes")
+	if code != exitcode.OK {
+		t.Fatalf("want 0, got %d\n%s\n%s", code, out, errs)
+	}
+	if mustJSON(t, f.body(post, 0)) != `{"dryRun":true,"proxyUrl":"http://sample-addon"}` || mustJSON(t, f.body(post, 1)) != `{"proxyUrl":"http://sample-addon"}` {
+		t.Fatalf("a refresh is a check, then an install from the recorded address: %v", f.bodies[post])
+	}
+	for _, s := range []string{
+		"status      already installed; installing again refreshes it",
+		"manifest    changed — the addon serves a different one than the one installed",
+		"refreshed sample: 1 tile, 1 slot row, 2 CLI commands, 1 container",
+	} {
+		if !strings.Contains(out, s) {
+			t.Errorf("output lacks %q:\n%s", s, out)
+		}
+	}
+	// The portal keeps no record of the space an addon was added to: say
+	// where its tiles go, unless --space names it.
+	if !strings.Contains(errs, "a refresh places its tile in the launchpad's first space unless --space names another") {
+		t.Errorf("the refresh must say where the tiles go: %q", errs)
+	}
+	_, _, errs = run(t, "", false, "refresh", "sample", "--url", srv.URL, "--yes", "--space", "tools")
+	if f.body(post, 3)["space"] != "tools" || strings.Contains(errs, "first space") {
+		t.Errorf("--space reaches the install, and the note goes: %v %q", f.body(post, 3), errs)
+	}
+
+	f.addons["chart-one"] = &recorded{key: "chart-one", chart: "oci://ghcr.io/example/charts/chart-one", title: "c"}
+	if code, _, errs := run(t, "", false, "refresh", "chart-one", "--url", srv.URL, "--yes"); code != exitcode.Usage || !strings.Contains(errs, "zae addon upgrade chart-one") {
+		t.Fatalf("a chart addon is not refreshed by hand: want 2, got %d %q", code, errs)
+	}
+	if code, _, _ := run(t, "", false, "refresh", "nosuch", "--url", srv.URL, "--yes"); code != exitcode.NotOffered {
+		t.Fatalf("an unknown addon: want 3, got %d", code)
+	}
+	code, out, _ = run(t, "n\n", true, "refresh", "sample", "--url", srv.URL)
+	if code != exitcode.Failed || !strings.Contains(out, "not refreshed") || !strings.Contains(out, "refresh sample on "+srv.URL+"? [y/N]") {
+		t.Fatalf("declined: want 1, got %d\n%s", code, out)
 	}
 }
 
@@ -203,6 +249,7 @@ func TestAddressAddonsNeedTheAdminRole(t *testing.T) {
 	for _, args := range [][]string{
 		{"add", "http://sample-addon", "--url", srv.URL, "--dry-run"},
 		{"add", "http://sample-addon", "--url", srv.URL, "--yes"},
+		{"refresh", "sample", "--url", srv.URL, "--yes"},
 	} {
 		if code, _, errs := run(t, "", false, args...); code != exitcode.Forbidden || !strings.Contains(errs, "managing addons needs the platform's admin role") {
 			t.Errorf("%v: want 5, got %d %q", args, code, errs)

@@ -66,6 +66,7 @@ Usage:
   zae addon upgrade <name> --url https://… [--version V | --chart REF] [--digest sha256:…]
       [--values FILE|-] [--set path=value]… [--set-secret path[=value]]… [--set-secret-file path=FILE]…
       [--secret-values FILE|-] [--clear-secret path]… [--yes] [--wait] [--timeout 5m]
+  zae addon refresh <name> --url https://… [--space S] [--yes]
   zae addon remove <name> --url https://… [--keep-values] [--yes]
 
 <chart> is oci://registry/path/chart with --version (or :tag), or an https://
@@ -80,7 +81,8 @@ manifest it serves and creates what it declares. add checks first and shows
 what that is; --dry-run stops there. --space picks the launchpad space its
 tiles go to, unless it brings its own. An addon installed from another
 address moves only with --replace-address: the portal's proxy then sends its
-requests, with their callers' tokens, to the new one. The platform
+requests, with their callers' tokens, to the new one. refresh reads the
+manifest of such an addon again, after it was redeployed. The platform
 neither deploys nor deletes these addons' containers.
 
 Values: --values is one JSON object (a file, or - for stdin); --set path=value
@@ -153,13 +155,15 @@ func Run(args []string) int {
 		return status(args[1:])
 	case "upgrade":
 		return upgrade(args[1:])
+	case "refresh":
+		return refresh(args[1:])
 	case "remove":
 		return remove(args[1:])
 	case "help", "--help", "-h":
 		usage(stdout)
 		return exitcode.OK
 	default:
-		errf("usage: zae addon has no command %q — add, list, status, upgrade, remove", args[0])
+		errf("usage: zae addon has no command %q — add, list, status, upgrade, refresh, remove", args[0])
 		return exitcode.Usage
 	}
 }

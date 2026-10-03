@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/zaentrum/zae/internal/exitcode"
+	"github.com/zaentrum/zae/internal/instance"
 )
 
 // installResult answers POST /api/portal/addons: what installing an addon
@@ -234,6 +235,93 @@ func checkSpace(ctx context.Context, c *client, base, space string) int {
 	}
 	errf("not offered: the launchpad of %s has no space %q — its spaces: %s", base, space, dash(strings.Join(keys, ", ")))
 	return exitcode.NotOffered
+}
+
+// refresh reads an address addon's manifest again — it was redeployed, and
+// what it contributes may have moved — after showing what that changes.
+func refresh(args []string) int {
+	s := newSession()
+	defer s.close()
+
+	fs := flagSet("refresh")
+	rawURL := fs.String("url", "", "public URL of the instance (required)")
+	space := fs.String("space", "", "the launchpad space its tiles go to, unless it brings its own (default: the first space)")
+	yes := fs.Bool("yes", false, "refresh without asking")
+	pos, code, ok := parse(fs, args)
+	if !ok {
+		return code
+	}
+	if len(pos) != 1 {
+		return usageErr("zae addon refresh <name> --url https://… takes one addon name")
+	}
+	base, err := instance.Base(*rawURL)
+	if err != nil {
+		return usageErr("%v", err)
+	}
+	name := pos[0]
+	if !validKey(name) {
+		return usageErr("%q is not a valid addon name", name)
+	}
+	if !*yes && !canAsk() {
+		return usageErr("stdin is not a terminal, so zae will not ask before refreshing — add --yes")
+	}
+	c := newClient(base)
+	row, _, err := findListed(s.ctx, c, name)
+	switch {
+	case err != nil:
+		return failOr(s, err, "")
+	case row == nil:
+		errf("not offered: %s has no addon %q — zae addon list --url %s lists what it has", base, name, base)
+		return exitcode.NotOffered
+	case row.Chart != nil:
+		return usageErr("%s is installed from the chart %s — the portal registers a chart addon again by itself, and zae addon upgrade %s changes its chart", name, row.Chart.Ref, name)
+	case row.ProxyURL == "":
+		errf("failed: the portal records no address for %s, so there is nothing to read it from — add it again: zae addon add http://… --url %s", name, base)
+		return exitcode.Failed
+	}
+	if *space != "" {
+		if code := checkSpace(s.ctx, c, base, *space); code != exitcode.OK {
+			return code
+		}
+	}
+	chk, _, code := check(s, c, base, row.ProxyURL, *space, false)
+	if chk == nil {
+		return code
+	}
+	renderCheck(stdout, chk, row.ProxyURL)
+	if row.RefreshAvailable {
+		label(stdout, "manifest", "changed — the addon serves a different one than the one installed")
+	} else {
+		label(stdout, "manifest", "unchanged — a refresh creates again what it declares")
+	}
+	if chk.PreviousAddress != "" {
+		errf("failed: %s is recorded at %s, not at %s — move it with zae addon add %s --replace-address --url %s", name, chk.PreviousAddress, row.ProxyURL, row.ProxyURL, base)
+		return exitcode.Failed
+	}
+	if chk.Tiles > 0 && chk.Space == nil && *space == "" {
+		// The portal keeps no record of the space an addon was added to.
+		tiles := "its tile"
+		if chk.Tiles > 1 {
+			tiles = fmt.Sprintf("its %d tiles", chk.Tiles)
+		}
+		note("a refresh places %s in the launchpad's first space unless --space names another", tiles)
+	}
+	if !*yes {
+		okay, cerr := s.confirm(fmt.Sprintf("refresh %s on %s?", name, base))
+		if errors.Is(cerr, errInterrupted) {
+			fmt.Fprintln(stdout, "interrupted — nothing written")
+			return s.exitCode()
+		}
+		if !okay {
+			fmt.Fprintln(stdout, "not refreshed")
+			return exitcode.Failed
+		}
+	}
+	body := map[string]any{"proxyUrl": row.ProxyURL}
+	if *space != "" {
+		body["space"] = *space
+	}
+	return installAddress(s, c, base, name, body)
 }
 
 // summarise is what an install created, or a check would create, in the order
