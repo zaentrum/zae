@@ -55,9 +55,14 @@ type fakeAddresses struct {
 	setups    map[string]string // key → the addon's own setup answer
 	oldPortal bool              // predates the check: ignores dryRun, and installs
 	noCharts  bool              // predates the chart API: its routes are the router's 404
-	refuse    int               // the status every install answers with, its body in refusal
-	refusal   string
-	installs  int
+	// chartsUnavailable is the note of a cluster that cannot install charts:
+	// the chart routes answer 503 with it, and the probe says so.
+	chartsUnavailable string
+	// chartsFail: the chart API fails for a moment.
+	chartsFail bool
+	refuse     int // the status every install answers with, its body in refusal
+	refusal    string
+	installs   int
 }
 
 func newAddresses(t *testing.T) (*fakeAddresses, *httptest.Server) {
@@ -84,7 +89,18 @@ func newAddresses(t *testing.T) (*fakeAddresses, *httptest.Server) {
 		http.Error(w, "no such app", http.StatusNotFound)
 	})
 	mux.HandleFunc("GET "+chartsPath+"/{name}", func(w http.ResponseWriter, r *http.Request) {
+		if f.chartsUnavailable != "" {
+			http.Error(w, f.chartsUnavailable, http.StatusServiceUnavailable)
+			return
+		}
+		if f.chartsFail {
+			http.Error(w, "etcdserver: request timed out", http.StatusInternalServerError)
+			return
+		}
 		http.Error(w, "no such addon", http.StatusNotFound)
+	})
+	mux.HandleFunc("GET "+chartsPath, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"available": f.chartsUnavailable == "", "note": f.chartsUnavailable})
 	})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -363,5 +379,88 @@ func TestStatusAndRemoveOfAnAddressAddonNeedTheAdminRole(t *testing.T) {
 	}
 	if f.addons["sample"] == nil {
 		t.Fatal("a refused removal removed")
+	}
+}
+
+// A cluster that cannot install addons from charts can still have addons
+// added by their address: status and remove find them all the same.
+func TestAddressAddonsWhereChartsCannotBeInstalled(t *testing.T) {
+	f, srv := newAddresses(t)
+	f.sample("1.2.0")
+	f.chartsUnavailable = "this cluster serves no ZaentrumAddon resource — update the zaentrum-operator to install addons from charts"
+	if code, out, errs := run(t, "", false, "status", "sample", "--url", srv.URL); code != exitcode.OK || !strings.Contains(out, "added by its address") {
+		t.Fatalf("status: want the address addon, got %d\n%s\n%s", code, out, errs)
+	}
+	if code, out, errs := run(t, "", false, "remove", "sample", "--url", srv.URL, "--yes"); code != exitcode.OK || f.addons["sample"] != nil {
+		t.Fatalf("remove: want it removed, got %d\n%s\n%s", code, out, errs)
+	}
+}
+
+// What an addon says about its setup is its own: a path that would climb out
+// of its proxy is not asked, and a state zae has not heard of reads unknown.
+func TestAnAddonsSetupAnswerIsReadWithCare(t *testing.T) {
+	f, srv := newAddresses(t)
+	a := f.sample("1.2.0")
+	a.setup = map[string]any{"path": "/../../operator", "sections": []any{map[string]any{"key": "storage", "title": "Storage", "required": true}}}
+	f.setups["sample"] = `{"state":"ready"}`
+	_, out, _ := run(t, "", false, "status", "sample", "--url", srv.URL)
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, "GET /api/portal/apps/") || strings.Contains(c, "operator") {
+			t.Fatalf("a setup path that climbs out was asked: %v", f.calls)
+		}
+	}
+	if !regexpLine(out, `^  setup       unknown — the addon did not answer its setup check`) {
+		t.Errorf("a setup that was not asked reads unknown:\n%s", out)
+	}
+
+	a.setup["path"] = "/api/setup"
+	f.setups["sample"] = `{"state":"rebooting","sections":[{"key":"storage","state":"exploded"}]}`
+	_, out, _ = run(t, "", false, "status", "sample", "--url", srv.URL)
+	if !regexpLine(out, `^  setup       unknown$`) || !regexpLine(out, `^    Storage\s+required\s+unknown$`) {
+		t.Errorf("states zae has not heard of read unknown:\n%s", out)
+	}
+}
+
+// The chart API's own 503 asks it whether charts can be installed; the
+// address routes' 503 is the portal unable to list its workloads for a
+// moment, and says nothing about charts.
+func TestA503FromTheAddressRoutesIsAMoment(t *testing.T) {
+	f, srv := newAddresses(t)
+	f.chartsUnavailable = "this cluster serves no ZaentrumAddon resource"
+	f.refuse, f.refusal = http.StatusServiceUnavailable, "the platform cannot list its workloads right now — try again shortly"
+	code, _, errs := run(t, "", false, "add", "http://sample-addon", "--url", srv.URL, "--dry-run")
+	if code != exitcode.Undetermined || strings.Contains(errs, "cannot install addons from charts") || !strings.Contains(errs, "try again shortly") {
+		t.Fatalf("want 4 in the portal's words, got %d %q", code, errs)
+	}
+}
+
+// A refusal that quotes what an addon served reaches the terminal without
+// its escape sequences.
+func TestARefusalCannotDriveTheTerminal(t *testing.T) {
+	f, srv := newAddresses(t)
+	f.refuse, f.refusal = http.StatusUnprocessableEntity, "the addon's manifest is invalid: service \"\x1b]0;owned\x07sample\" is not a DNS label"
+	code, _, errs := run(t, "", false, "add", "http://sample-addon", "--url", srv.URL, "--dry-run")
+	if code != exitcode.Failed || strings.ContainsAny(errs, "\x1b\x07") || !strings.Contains(errs, "is not a DNS label") {
+		t.Fatalf("want 1 with the refusal, minus its control characters, got %d %q", code, errs)
+	}
+}
+
+// Only "no such addon" sends status and remove to the addons list. A chart
+// API that failed said nothing about the addon, and an addon registered from
+// a chart is not removed by its rows.
+func TestOnlyNoSuchAddonFallsBackToTheList(t *testing.T) {
+	f, srv := newAddresses(t)
+	f.sample("1.2.0")
+	f.chartsFail = true
+	code, out, errs := run(t, "", false, "status", "sample", "--url", srv.URL)
+	if code != exitcode.Failed || !strings.Contains(errs, "etcdserver: request timed out") || f.called("GET "+addonsPath) != 0 {
+		t.Fatalf("a failing chart API: want 1 without reading the list, got %d\n%s\n%s", code, out, errs)
+	}
+	f.chartsFail = false
+
+	f.addons["chart-one"] = &recorded{key: "chart-one", chart: "oci://ghcr.io/example/charts/chart-one", title: "c"}
+	code, _, errs = run(t, "", false, "remove", "chart-one", "--url", srv.URL, "--yes")
+	if code != exitcode.NotOffered || f.called("DELETE "+addonsPath+"/chart-one") != 0 {
+		t.Fatalf("a chart addon's rows are its chart's to remove: want 3 and no DELETE, got %d %q %v", code, errs, f.calls)
 	}
 }

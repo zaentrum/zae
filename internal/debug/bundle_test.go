@@ -121,3 +121,28 @@ func TestBundleUsageAndRefusals(t *testing.T) {
 		t.Errorf("without a bearer: want 5 naming the role, got %d %q", code, errs)
 	}
 }
+
+// "Never over a file" holds even for one that appears while the portal
+// assembles: the write itself refuses it.
+func TestBundleIsWrittenToANewFileOnly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bundle.json")
+	if err := os.WriteFile(path, []byte("keep me"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeNew(path, []byte(`{"kind":"zaentrum-support-bundle"}`)); err == nil {
+		t.Fatal("a file that exists must not be written over")
+	}
+	if b, _ := os.ReadFile(path); string(b) != "keep me" {
+		t.Fatalf("the file was changed: %q", b)
+	}
+}
+
+// JSON that is not a support bundle — another service's answer — is not
+// written as one.
+func TestBundleThatIsNotOne(t *testing.T) {
+	p, srv := newPortal(t)
+	p.bundle = `{"kind":"something-else","sections":{}}`
+	if code, out, errs := run(t, "bundle", "-o", "-", "--url", srv.URL); code != exitcode.Undetermined || out != "" {
+		t.Fatalf("want 4 and nothing written, got %d %q %q", code, out, errs)
+	}
+}

@@ -205,6 +205,10 @@ func run(t *testing.T, args ...string) (code int, out, errs string) {
 		sigChannel = nil
 		sigMu.Unlock()
 	}()
+	// A follow ends on Ctrl-C only. One that a broken rule keeps running is
+	// interrupted here, and fails on its exit code instead of hanging the suite.
+	guard := time.AfterFunc(10*time.Second, interrupt)
+	defer guard.Stop()
 	code = Run(args, "v9.9.9-test")
 	return code, ob.String(), eb.String()
 }

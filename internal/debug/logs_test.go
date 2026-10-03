@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zaentrum/zae/internal/exitcode"
 )
@@ -283,6 +284,11 @@ func TestFollowRidesOutAFailureAndStopsAtARefusal(t *testing.T) {
 	if strings.Count(out, "database system is ready") != 1 {
 		t.Errorf("the line from before the failure is printed once:\n%s", out)
 	}
+	// A workload followed through a rollout reads more pods than it began
+	// with, so even one pod's lines say whose they are.
+	if !strings.Contains(out, "[postgres-0/postgres] "+line(9, "after the hiccup")) {
+		t.Errorf("a followed workload's lines carry their pod:\n%s", out)
+	}
 }
 
 func TestLogsUsage(t *testing.T) {
@@ -298,4 +304,110 @@ func TestLogsUsage(t *testing.T) {
 		"since zero":             {"logs", "postgres", "--url", srv.URL, "--since", "0s"},
 		"a bad container":        {"logs", "postgres", "--url", srv.URL, "--container", "Bad Name"},
 	})
+}
+
+// A line can arrive after the newest one printed with the very same stamp:
+// the cluster stamps every line of one write alike, and a read may see only
+// the first lines of it. It is printed, once — and the lines read again are
+// not.
+func TestFollowPrintsALateLineWithTheNewestStamp(t *testing.T) {
+	p, srv := newPortal(t)
+	exampleNamespace(p)
+	k := "postgres-0/postgres"
+	p.logs[k] = []string{line(1, "first of one write")}
+	p.onList = func(p *fakePortal, n int) {
+		switch {
+		case n == 2:
+			p.logs[k] = append(p.logs[k], line(1, "second of the same write"))
+		case n == 4:
+			go interrupt()
+		}
+	}
+	code, out, errs := run(t, "logs", "postgres-0", "--url", srv.URL, "--follow")
+	if code != 130 {
+		t.Fatalf("want 130, got %d\n%s\n%s", code, out, errs)
+	}
+	if want := line(1, "first of one write") + "\n" + line(1, "second of the same write") + "\n"; out != want {
+		t.Fatalf("each line once:\n got:\n%s\nwant:\n%s", out, want)
+	}
+}
+
+// Each read after the first asks for the window since the read before it,
+// widened by the margin — measured on this machine's clock, here a minute a
+// round — not for everything since the follow began, and never for less
+// than the margin.
+func TestFollowReadsTheWindowSinceTheLastRead(t *testing.T) {
+	p, srv := newPortal(t)
+	exampleNamespace(p)
+	clock := time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)
+	now = func() time.Time { return clock }
+	t.Cleanup(func() { now = time.Now })
+	p.onList = func(p *fakePortal, n int) {
+		clock = clock.Add(time.Minute)
+		if n == 6 {
+			go interrupt()
+		}
+	}
+	if code, out, errs := run(t, "logs", "postgres", "--url", srv.URL, "--follow"); code != 130 {
+		t.Fatalf("want 130, got %d\n%s\n%s", code, out, errs)
+	}
+	if len(p.logQ) < 4 {
+		t.Fatalf("too few reads: %v", p.logQ)
+	}
+	margin := int(followMargin / time.Second)
+	// The first round reads in the minute the first read was made: the margin
+	// alone. Every one after it, the minute since the read before.
+	if since, _ := strconv.Atoi(p.logQ[1].Get("since")); since != margin {
+		t.Errorf("the first follow read asked for %ds, want the margin, %ds", since, margin)
+	}
+	for _, q := range p.logQ[2:] {
+		since, _ := strconv.Atoi(q.Get("since"))
+		if want := 60 + margin; since != want {
+			t.Errorf("a read asked for %ds, want the minute since the last read and the margin, %ds: %v", since, want, q)
+		}
+	}
+	if margin < 5 {
+		t.Errorf("a margin of %ds leaves a line written while a read was on its way unread", margin)
+	}
+}
+
+// More lines than the portal returns in one read means some were not read:
+// the follow says so instead of pretending to be complete.
+func TestFollowSaysWhenAReadOverflows(t *testing.T) {
+	p, srv := newPortal(t)
+	exampleNamespace(p)
+	k := "postgres-0/postgres"
+	p.onList = func(p *fakePortal, n int) {
+		switch {
+		case n == 2:
+			for i := 0; i < maxTail+10; i++ {
+				p.logs[k] = append(p.logs[k], line(10+i, "busy"))
+			}
+		case n == 4:
+			go interrupt()
+		}
+	}
+	code, _, errs := run(t, "logs", "postgres", "--url", srv.URL, "--follow")
+	if code != 130 || !strings.Contains(errs, "wrote more than 5000 lines between two reads — some of them were not read") {
+		t.Fatalf("want 130 and the note, got %d %q", code, errs)
+	}
+}
+
+// A line the portal sent without a readable stamp stays after the line before
+// it when logs are merged — not first, as if it were the oldest.
+func TestAnUnstampedLineKeepsItsPlace(t *testing.T) {
+	p, srv := newPortal(t)
+	exampleNamespace(p)
+	p.logs["portal-api-554bd55786-krtkx/app"] = []string{line(1, "app starts"), "  at a continuation the stamp missed", line(3, "app serves")}
+	p.logs["portal-api-554bd55786-krtkx/proxy"] = []string{line(2, "proxy starts")}
+	_, out, _ := run(t, "logs", "portal-api", "--url", srv.URL)
+	want := strings.Join([]string{
+		"[portal-api-554bd55786-krtkx/app] " + line(1, "app starts"),
+		"[portal-api-554bd55786-krtkx/app]   at a continuation the stamp missed",
+		"[portal-api-554bd55786-krtkx/proxy] " + line(2, "proxy starts"),
+		"[portal-api-554bd55786-krtkx/app] " + line(3, "app serves"),
+	}, "\n") + "\n"
+	if out != want {
+		t.Fatalf("an unstamped line keeps its place:\n got:\n%s\nwant:\n%s", out, want)
+	}
 }

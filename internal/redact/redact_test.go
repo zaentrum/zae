@@ -21,6 +21,9 @@ func TestSecrets(t *testing.T) {
 			in: `curl -H 'basic cG9ydGFsOnMzY3JldA==' http://x`, mustRedact: []string{"cG9ydGFsOnMzY3JldA=="}},
 		"a bearer in an authorization header": {
 			in: `Authorization: Bearer sk-9f8a7b6c5d4e3f2a1b0c9d8e`, mustRedact: []string{"sk-9f8a7b6c5d4e3f2a1b0c9d8e"}, keep: []string{"Bearer"}},
+		// Too short for the bare-bearer rule: only the header rule sees it.
+		"a short credential in an authorization header": {
+			in: `proxy-authorization: Digest c2hvcnQ`, mustRedact: []string{"c2hvcnQ"}, keep: []string{"Digest"}},
 		"bearer prose": {
 			in: `oidc discovery succeeded; bearer verification active`, keep: []string{"bearer verification active"}},
 		"a JWT on its own": {
@@ -73,7 +76,8 @@ func TestSecretsTwiceIsOnce(t *testing.T) {
 // escaped quote, whose backslash the value pattern would swallow.
 func TestJSONRedactsValuesAndStaysJSON(t *testing.T) {
 	raw := []byte(`{"line":"token=abc\"def","count":12345678901234567890,"nested":[{"dsn":"postgres://u:pw@db:5432/x"}],` +
-		`"html":"<b>&</b>","clientSecret":"two words","token-service-6d4f/app":"a plain log line","secretKeys":["database.password"]}`)
+		`"html":"<b>&</b>","clientSecret":"two words","token-service-6d4f/app":"a plain log line","secretKeys":["database.password"],` +
+		`"postgres-0/token-refresher":"another plain log line"}`)
 	out, err := JSON(raw, "")
 	if err != nil {
 		t.Fatal(err)
@@ -92,8 +96,9 @@ func TestJSONRedactsValuesAndStaysJSON(t *testing.T) {
 		`12345678901234567890`, `"<b>&</b>"`, "postgres://u:", "@db:5432/x",
 		// A key with a credential's word in it is not a credential's name
 		// when the text pass would not read it as one: a pod's log, keyed by
-		// pod and container, stays a log.
+		// pod and container, stays a log — wherever the word is.
 		`"token-service-6d4f/app":"a plain log line"`,
+		`"postgres-0/token-refresher":"another plain log line"`,
 		// What a key names is redacted only when it is a string: a list of
 		// secret input PATHS is not a list of secrets.
 		`"secretKeys":["database.password"]`,
@@ -104,6 +109,10 @@ func TestJSONRedactsValuesAndStaysJSON(t *testing.T) {
 	}
 	if !strings.Contains(s, `"clientSecret":"***REDACTED***"`) {
 		t.Errorf("a credential's value goes whole, not to its first space: %s", s)
+	}
+	// An empty one says no credential is set; a marker would say one is.
+	if out, _ := JSON([]byte(`{"password":""}`), ""); string(out) != `{"password":""}` {
+		t.Errorf("an empty credential stays empty: %s", out)
 	}
 	if _, err := JSON([]byte(`{"open":`), ""); err == nil {
 		t.Error("a document that does not parse is an error, not an empty answer")

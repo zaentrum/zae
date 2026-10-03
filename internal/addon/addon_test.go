@@ -784,7 +784,7 @@ func TestList(t *testing.T) {
 	   "phase":"Planned","suspended":true,"registered":true,
 	   "components":[{"name":"example","ready":1,"desired":1},{"name":"example-worker","ready":0,"desired":1}]},
 	  {"key":"fresh","chart":{"ref":"https://example.org/charts/fresh-0.1.0.tgz","version":"","lastApplied":null},
-	   "phase":"Ready","registered":false,"components":[]},
+	   "phase":"Ready","registered":false,"components":[],"refreshAvailable":true},
 	  {"key":"other","proxyUrl":"http://other","version":"0.4.0","registered":true,"refreshAvailable":true,
 	   "components":[{"name":"other","ready":null,"desired":null}]}
 	]`
