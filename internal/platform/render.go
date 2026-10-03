@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
 )
 
 // controllerHeading opens the controller section of a status.
@@ -28,6 +29,10 @@ func renderStatus(w io.Writer, base string, c *Console) {
 	label(w, "phase", dash(op.Phase))
 	label(w, "running", dash(op.CurrentVersion))
 	label(w, "update", updateLine(op, base))
+	label(w, "verified", verificationLine(op.Verification, now()))
+	for _, f := range failingChecks(op.Verification) {
+		fmt.Fprintf(w, "  %-13s%s\n", "", f)
+	}
 	if op.Hostname != "" {
 		label(w, "host", op.Hostname)
 	}
@@ -39,6 +44,160 @@ func renderStatus(w io.Writer, base string, c *Console) {
 	renderWorkloads(w, c)
 	fmt.Fprintln(w)
 	renderController(w, controllerHeading, op.Controller)
+}
+
+// verificationLine is the platform's last check of itself, on one line: how
+// it came out, when, and what it verified —
+//
+//	passed 14/14 · 3 min ago · after the update to 1.5.0 (image set 3f9a1c0b2d4e)
+//
+// — or that it never ran, is running, could not run, or is switched off.
+func verificationLine(v *Verification, at time.Time) string {
+	switch {
+	case v == nil:
+		return "not reported — this portal-api predates the platform's verification of itself"
+	case v.Note != "":
+		return "unreadable — " + v.Note
+	case v.off():
+		return "off — the platform does not verify itself (spec.verification.enabled is false)"
+	}
+	var parts []string
+	switch v.Result {
+	case "":
+		parts = append(parts, "never")
+	case VerifyPassed:
+		parts = append(parts, "passed "+v.score())
+	case VerifyFailed:
+		parts = append(parts, fmt.Sprintf("FAILED %d of %d checks", v.Failed, v.total()))
+	case VerifyRunning:
+		run := "running"
+		if v.Job != "" {
+			run += " (job " + v.Job + ")"
+		}
+		parts = append(parts, run)
+	case VerifyError:
+		parts = append(parts, "error — "+orNoReason(v.Message))
+	case VerifySkipped:
+		parts = append(parts, "skipped — "+orNoReason(v.Message))
+	default:
+		// A result this zae has not heard of is shown as it came.
+		parts = append(parts, v.Result)
+	}
+	if v.Result != "" {
+		if when := v.when(at); when != "" {
+			parts = append(parts, when)
+		}
+		if what := v.what(); what != "" {
+			parts = append(parts, what)
+		}
+	}
+	switch {
+	case v.PendingRequest == "" || v.PendingRequest == v.Request:
+	case v.Result == "":
+		parts[0] = "never — one is asked for and waits to run"
+	default:
+		parts = append(parts, "another run is asked for and waits")
+	}
+	return strings.Join(parts, " · ")
+}
+
+// score is "14/14", and what of the rest was not a failure.
+func (v *Verification) score() string {
+	s := fmt.Sprintf("%d/%d", v.Passed, v.total())
+	if v.Warned > 0 {
+		s += ", " + count(v.Warned, "warning", "warnings")
+	}
+	if v.Skipped > 0 {
+		s += fmt.Sprintf(", %d skipped", v.Skipped)
+	}
+	return s
+}
+
+// when is how long ago the run ended — or, while it runs, began.
+func (v *Verification) when(at time.Time) string {
+	if v.Result == VerifyRunning || v.FinishedAt == "" {
+		if v.StartedAt == "" {
+			return ""
+		}
+		return "started " + ago(v.StartedAt, at)
+	}
+	return ago(v.FinishedAt, at)
+}
+
+// what is what the run verified: the platform version, the image set, and
+// whether a rollout or a person asked for it.
+func (v *Verification) what() string {
+	ver := strings.TrimSpace(v.Version)
+	set := ""
+	if fp := strings.TrimSpace(v.Fingerprint); fp != "" {
+		set = " (image set " + fp + ")"
+	}
+	switch {
+	case v.Trigger == "update" && ver != "":
+		return "after the update to " + ver + set
+	case v.Trigger == "update":
+		return "after an update" + set
+	case v.Trigger == "request" && ver != "":
+		return "asked for, at " + ver + set
+	case v.Trigger == "request":
+		return "asked for" + set
+	case ver != "":
+		return "at " + ver + set
+	}
+	return strings.TrimSpace(set)
+}
+
+// failingChecks are the lines a failed run is shown with: each check that
+// failed, and what it found.
+func failingChecks(v *Verification) []string {
+	if v == nil || v.Result != VerifyFailed {
+		return nil
+	}
+	var out []string
+	for _, c := range v.Checks {
+		if c.Status == "fail" {
+			out = append(out, clipLine("✗ "+c.Name+" — "+dash(c.Detail), 120))
+		}
+	}
+	if len(out) == 0 && v.Failed > 0 {
+		out = append(out, "(the failing checks were not reported)")
+	}
+	return out
+}
+
+func orNoReason(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "no reason given"
+	}
+	return strings.TrimSpace(s)
+}
+
+// ago names a time for a person: "just now", "3 min ago", "5 h ago", "2 days
+// ago". A time zae cannot read is shown as it came.
+func ago(ts string, at time.Time) string {
+	t, err := time.Parse(time.RFC3339, strings.TrimSpace(ts))
+	if err != nil {
+		return "at " + ts
+	}
+	d := at.Sub(t)
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return fmt.Sprintf("%d min ago", int(d.Minutes()))
+	case d < 48*time.Hour:
+		return fmt.Sprintf("%d h ago", int(d.Hours()))
+	}
+	return fmt.Sprintf("%d days ago", int(d.Hours()/24))
+}
+
+// clipLine shortens s to n characters, marking the cut.
+func clipLine(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n-1]) + "…"
 }
 
 // renderController prints the operator's own controller: what is in charge,

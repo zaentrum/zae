@@ -45,6 +45,8 @@ var (
 	canAsk = stdinIsTerminal
 	// pollInterval paces every wait.
 	pollInterval = 2 * time.Second
+	// now is the clock a status reads "3 min ago" against.
+	now = time.Now
 )
 
 // defaultTimeout: a platform update rolls every service, pulling an image per

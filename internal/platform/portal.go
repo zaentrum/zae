@@ -88,6 +88,9 @@ type Operator struct {
 	// than the field — a different thing from reporting blanks, and zae says
 	// so in different words.
 	Controller *Controller `json:"controller"`
+	// Verification is the platform's last check of itself. A pointer for the
+	// same reason as Controller: a portal-api older than it sends no key.
+	Verification *Verification `json:"verification,omitempty"`
 	// Note says why there is nothing to report, when Present is false.
 	Note string `json:"note"`
 }
@@ -114,6 +117,80 @@ type Controller struct {
 	AvailableUpdate string `json:"availableUpdate"`
 	// ObservedAt is when the operator last looked.
 	ObservedAt string `json:"observedAt"`
+}
+
+// Verification is the platform verifying ITSELF. After every rollout — and
+// when someone asks — the operator runs `zae doctor --sign-in` in the
+// platform's own namespace, signed in as a test account it created, so no
+// password ever leaves the cluster; it records what the doctor found on its
+// resource (status.verification) and the portal mirrors that here.
+//
+// A run that never happened is {"enabled": true, "result": null}: Result is
+// then "". Enabled false is a platform that does not verify itself at all.
+type Verification struct {
+	Enabled *bool `json:"enabled"`
+	// Result is Passed, Failed, Running, Skipped or Error — "" before the
+	// first run.
+	Result string `json:"result"`
+	// Trigger is what started the run: update (a rollout) or request.
+	Trigger string `json:"trigger"`
+	// Request is the request a request-run answered; PendingRequest is one
+	// that is asked for and has not started yet.
+	Request        string `json:"request"`
+	PendingRequest string `json:"pendingRequest"`
+	// Fingerprint names the set of images verified (12 hex), and Version the
+	// platform version they were.
+	Fingerprint string `json:"fingerprint"`
+	Version     string `json:"version"`
+	// StartedAt and FinishedAt are RFC 3339; FinishedAt is "" while running.
+	StartedAt  string              `json:"startedAt"`
+	FinishedAt string              `json:"finishedAt"`
+	Job        string              `json:"job"`
+	Passed     int                 `json:"passed"`
+	Failed     int                 `json:"failed"`
+	Warned     int                 `json:"warned"`
+	Skipped    int                 `json:"skipped"`
+	Checks     []VerificationCheck `json:"checks"`
+	// Message says why a run is an Error or was Skipped.
+	Message string `json:"message"`
+	// Note: the portal could not read the operator's record.
+	Note string `json:"note"`
+}
+
+// VerificationCheck is one line of the doctor's report.
+type VerificationCheck struct {
+	Name   string `json:"name"`
+	Status string `json:"status"` // ok | warn | fail | skip
+	Detail string `json:"detail"`
+}
+
+// Verification results.
+const (
+	VerifyPassed  = "Passed"
+	VerifyFailed  = "Failed"
+	VerifyRunning = "Running"
+	VerifySkipped = "Skipped"
+	VerifyError   = "Error"
+)
+
+// final reports whether a run has ended.
+func (v *Verification) final() bool {
+	switch v.Result {
+	case VerifyPassed, VerifyFailed, VerifySkipped, VerifyError:
+		return true
+	}
+	return false
+}
+
+// off reports whether the platform does not verify itself at all.
+func (v *Verification) off() bool { return v.Enabled != nil && !*v.Enabled }
+
+// total is how many checks the run made.
+func (v *Verification) total() int {
+	if n := v.Passed + v.Failed + v.Warned + v.Skipped; n > 0 {
+		return n
+	}
+	return len(v.Checks)
 }
 
 // Install sources. Each one names a different thing to go and do, which is the

@@ -50,6 +50,11 @@ type fakePortal struct {
 	onGet       func(p *fakePortal, n int)
 	onWrite     func(p *fakePortal)
 	beforeApply func(p *fakePortal)
+
+	// verificationRaw, when set, is sent as operator.verification exactly as
+	// written — `{"enabled":true,"result":null}` is not what encoding a
+	// Verification produces.
+	verificationRaw string
 }
 
 func newPortal(t *testing.T) (*fakePortal, *httptest.Server) {
@@ -133,7 +138,11 @@ func (p *fakePortal) get(w http.ResponseWriter, r *http.Request) {
 			"operator": map[string]any{"present": false, "note": noManagement + " (not running in a cluster)"}})
 		return
 	}
-	out := map[string]any{"available": true, "operator": p.strip(p.op), "instances": p.instances()}
+	op := p.strip(p.op)
+	if p.verificationRaw != "" && !p.legacy {
+		op["verification"] = json.RawMessage(p.verificationRaw)
+	}
+	out := map[string]any{"available": true, "operator": op, "instances": p.instances()}
 	if p.listError != "" {
 		out["error"] = p.listError
 		out["instances"] = []any{}
@@ -161,7 +170,7 @@ func (p *fakePortal) strip(v any) map[string]any {
 	if p.legacy {
 		// The controller is newer than the rollout fields, so a portal that
 		// has never heard of those has certainly never heard of it.
-		for _, k := range []string{"generation", "observedGeneration", "restartedAt", "replicas", "controller"} {
+		for _, k := range []string{"generation", "observedGeneration", "restartedAt", "replicas", "controller", "verification"} {
 			delete(m, k)
 		}
 	}
@@ -286,6 +295,8 @@ func (p *fakePortal) restart(w http.ResponseWriter, r *http.Request) {
 		p.answer(w, write{Name: wl.Name, Generation: wl.Generation, RestartedAt: wl.RestartedAt})
 	}
 }
+
+func ptr[T any](v T) *T { return &v }
 
 func (p *fakePortal) workload(name string) *Workload {
 	for i := range p.workloads {
