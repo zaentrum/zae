@@ -420,11 +420,11 @@ func update(args []string) int {
 	if set["channel"] {
 		v := strings.TrimSpace(*channel)
 		body["channel"] = v
-		chs = append(chs, change{"channel", op.Channel, v})
+		chs = append(chs, change{"channel", channelOr(op.Channel), v})
 	}
 	if set["mode"] {
 		body["updateMode"] = *mode
-		chs = append(chs, change{"update mode", op.UpdateMode, *mode})
+		chs = append(chs, change{"update mode", modeOr(op.UpdateMode), *mode})
 	}
 	if *apply {
 		// The operator discovered it; applying is pinning the platform to it.

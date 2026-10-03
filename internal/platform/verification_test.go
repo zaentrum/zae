@@ -40,7 +40,7 @@ func TestStatusShowsTheLastVerification(t *testing.T) {
 		want []string
 	}{
 		"never run": {raw: `{"enabled":true,"result":null}`, want: []string{"verified     never\n"}},
-		"passed":    {v: passed(), want: []string{"verified     passed 14/14 · 3 min ago · after the update to 1.5.0 (image set 3f9a1c0b2d4e)\n"}},
+		"passed":    {v: passed(), want: []string{"verified     passed 14/14 · 3 min ago · after the update to 1.5.0 (image set 3f9a1c0b2d4e) · job zaentrum-verify-7f3c\n"}},
 		"passed, with warnings and skips": {v: func() *Verification {
 			v := passed()
 			v.Passed, v.Warned, v.Skipped = 11, 1, 2
@@ -56,13 +56,13 @@ func TestStatusShowsTheLastVerification(t *testing.T) {
 			}
 			return v
 		}(), want: []string{
-			"verified     FAILED 2 of 14 checks · 3 min ago · after the update to 1.5.0 (image set 3f9a1c0b2d4e)\n",
+			"verified     FAILED 2 of 14 checks · 3 min ago · after the update to 1.5.0 (image set 3f9a1c0b2d4e) · job zaentrum-verify-7f3c\n",
 			"\n               ✗ chino-api: items — /api/v1/items answered HTTP 502 · fix: the catalog is down\n",
 			"\n               ✗ app /chino/ — the page loads /chino/assets/index.js, which answers HTTP 404\n",
 		}},
 		"running": {v: &Verification{Enabled: ptr(true), Result: VerifyRunning, Trigger: "update", Version: "1.5.0",
 			StartedAt: stamp(2 * time.Minute), Job: "zaentrum-verify-7f3c"},
-			want: []string{"verified     running (job zaentrum-verify-7f3c) · started 2 min ago · after the update to 1.5.0\n"}},
+			want: []string{"verified     running · started 2 min ago · after the update to 1.5.0 · job zaentrum-verify-7f3c\n"}},
 		"an error": {v: &Verification{Enabled: ptr(true), Result: VerifyError, Trigger: "update", Version: "1.5.0",
 			StartedAt: stamp(2 * time.Minute), FinishedAt: stamp(time.Minute), Message: "the verification job could not pull ghcr.io/zaentrum/zae"},
 			want: []string{"verified     error — the verification job could not pull ghcr.io/zaentrum/zae · 1 min ago · after the update to 1.5.0\n"}},
@@ -74,7 +74,7 @@ func TestStatusShowsTheLastVerification(t *testing.T) {
 		"a request waits, never run": {raw: `{"enabled":true,"result":null,"pendingRequest":"r1"}`,
 			want: []string{"verified     never — one is asked for and waits to run\n"}},
 		"a request waits after a run": {v: func() *Verification { v := passed(); v.PendingRequest = "r2"; return v }(),
-			want: []string{"after the update to 1.5.0 (image set 3f9a1c0b2d4e) · another run is asked for and waits\n"}},
+			want: []string{"after the update to 1.5.0 (image set 3f9a1c0b2d4e) · job zaentrum-verify-7f3c · another run is asked for and waits\n"}},
 		"hours ago":   {v: func() *Verification { v := passed(); v.FinishedAt = stamp(5 * time.Hour); return v }(), want: []string{"· 5 h ago ·"}},
 		"days ago":    {v: func() *Verification { v := passed(); v.FinishedAt = stamp(72 * time.Hour); return v }(), want: []string{"· 3 days ago ·"}},
 		"unreadable":  {raw: `{"enabled":true,"result":null,"note":"status.verification is not readable"}`, want: []string{"verified     unreadable — status.verification is not readable\n"}},

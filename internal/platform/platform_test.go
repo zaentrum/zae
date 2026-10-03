@@ -1566,3 +1566,32 @@ func TestWorkloadListMissing(t *testing.T) {
 		t.Errorf("the missing list must be named:\n%s", out)
 	}
 }
+
+// What the resource leaves unset is shown as what the operator does — the
+// console's "manual" and "stable" — and said to be the default, never "-".
+func TestStatusShowsTheEffectiveDefaults(t *testing.T) {
+	p, srv := newPortal(t)
+	p.op.UpdateMode, p.op.Channel, p.op.AvailableUpdate, p.op.Version = "", "", "", ""
+	code, out, errs := run(t, "", false, "status", "--url", srv.URL)
+	if code != exitcode.OK {
+		t.Fatalf("want 0, got %d %s", code, errs)
+	}
+	for _, s := range []string{
+		"update mode  manual — an update is applied when someone asks for it (the default: the resource sets none)",
+		"channel      stable (the default: the resource sets none)",
+		"version      latest — nothing pinned; the operator follows the stable channel",
+		"update       none offered on the stable channel",
+	} {
+		if !strings.Contains(out, s) {
+			t.Errorf("status lacks %q:\n%s", s, out)
+		}
+	}
+	if regexpLine(out, `^  (update mode|channel)\s+-$`) {
+		t.Errorf("an unset field reads as a dash:\n%s", out)
+	}
+	// And an update starts from those values.
+	code, out, _ = run(t, "", false, "update", "--url", srv.URL, "--mode", "auto", "--channel", "edge", "--yes")
+	if code != exitcode.OK || !strings.Contains(out, "update mode  manual → auto") || !strings.Contains(out, "channel      stable → edge") {
+		t.Fatalf("the change starts from the effective values: %d\n%s", code, out)
+	}
+}

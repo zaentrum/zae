@@ -79,7 +79,7 @@ func TestVerifyWaitsForTheRunItAskedFor(t *testing.T) {
 	for _, want := range []string{
 		"waiting for the operator to verify " + srv.URL,
 		"asked for — the operator has not started the run yet",
-		"running (job zaentrum-verify-9a1b)",
+		"running · started just now · asked for · job zaentrum-verify-9a1b",
 		"  ✓ tls                          certificate valid",
 		"  - chino-api: playback          no packaged title to play",
 		"verified: passed 13/14, 1 skipped",

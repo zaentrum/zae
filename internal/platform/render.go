@@ -28,7 +28,7 @@ func renderStatus(w io.Writer, base string, c *Console) {
 	}
 	fmt.Fprintf(w, "%s — the platform\n", base)
 	label(w, "version", versionLine(op))
-	label(w, "channel", dash(op.Channel))
+	label(w, "channel", channelLine(op))
 	label(w, "update mode", updateModeLine(op))
 	label(w, "phase", dash(op.Phase))
 	label(w, "running", dash(op.CurrentVersion))
@@ -90,11 +90,7 @@ func verificationLine(v *Verification, at time.Time) string {
 	case VerifyFailed:
 		parts = append(parts, fmt.Sprintf("FAILED %d of %d checks", v.Failed, v.total()))
 	case VerifyRunning:
-		run := "running"
-		if v.Job != "" {
-			run += " (job " + v.Job + ")"
-		}
-		parts = append(parts, run)
+		parts = append(parts, "running")
 	case VerifyError:
 		parts = append(parts, "error — "+orNoReason(v.Message))
 	case VerifySkipped:
@@ -109,6 +105,11 @@ func verificationLine(v *Verification, at time.Time) string {
 		}
 		if what := v.what(); what != "" {
 			parts = append(parts, what)
+		}
+		// The job is where the run's own log is — zae debug logs <job> —
+		// and the console shows it beside the result.
+		if job := strings.TrimSpace(v.Job); job != "" {
+			parts = append(parts, "job "+job)
 		}
 	}
 	switch {
@@ -458,17 +459,44 @@ func versionLine(op Operator) string {
 	return v + " — pinned"
 }
 
+// The operator's own defaults for what its resource leaves unset. The console
+// shows them for an empty field, because they are what the operator does.
+const (
+	defaultChannel    = "stable"
+	defaultUpdateMode = "manual"
+	unsetNote         = " (the default: the resource sets none)"
+)
+
 func updateModeLine(op Operator) string {
-	switch strings.TrimSpace(op.UpdateMode) {
+	switch m := strings.TrimSpace(op.UpdateMode); m {
 	case "auto":
 		return "auto — the operator applies in-channel updates itself"
-	case "manual":
-		return "manual — an update is applied when someone asks for it"
-	case "":
-		return "-"
+	case "manual", "":
+		s := "manual — an update is applied when someone asks for it"
+		if m == "" {
+			s += unsetNote
+		}
+		return s
 	default:
 		return op.UpdateMode
 	}
+}
+
+// channelLine is the channel the operator follows: the one the resource names,
+// or the operator's default when it names none.
+func channelLine(op Operator) string {
+	if strings.TrimSpace(op.Channel) == "" {
+		return defaultChannel + unsetNote
+	}
+	return op.Channel
+}
+
+// modeOr is the update mode in effect.
+func modeOr(m string) string {
+	if strings.TrimSpace(m) == "" {
+		return defaultUpdateMode
+	}
+	return strings.TrimSpace(m)
 }
 
 // updateLine says whether there is an update, and what applies it.
@@ -483,11 +511,12 @@ func updateLine(op Operator, base string) string {
 	return fmt.Sprintf("%s available — apply it with: zae platform update --apply --url %s", up, base)
 }
 
+// channelOr is the channel in effect.
 func channelOr(c string) string {
 	if strings.TrimSpace(c) == "" {
-		return "configured release"
+		return defaultChannel
 	}
-	return c
+	return strings.TrimSpace(c)
 }
 
 // change is one field an update asks to change.
