@@ -89,7 +89,10 @@ own. --wait follows the rollout until the platform reports the new version and
 every workload the operator manages is ready.
 
 restart and scale act on one workload. The platform protects its stateful
-services and refuses those itself, in its own words.
+services and refuses those itself, in its own words. Both work without an
+operator too — direct mode, where the portal acts on the Deployments
+themselves — and so does status, which then shows the workloads; update,
+verify and controller need the operator's resource.
 
 verify asks the operator to verify the platform now — the check it makes by
 itself after every rollout: zae doctor --sign-in, run in the platform's own
@@ -114,9 +117,10 @@ same job and the half that happens far more often.
 Needs the platform's admin role: sign in with 'zae login --url …', or carry a
 bearer in ZAE_TOKEN (which wins when it is set).
 Exit codes: 0 done · 1 the instance refused it, the change was declined, it
-was not ready in time, or a verification failed · 2 usage · 3 this instance has
-no operator console, no such workload, no controller reported, or no
-verification of itself · 4 undetermined · 5 forbidden.
+was not ready in time, or a verification failed · 2 usage · 3 this instance
+manages no workloads, has no operator (for update, verify, controller), runs
+no such workload, reports no controller, or does not verify itself · 4
+undetermined · 5 forbidden.
 `)
 }
 
@@ -232,15 +236,33 @@ func confirm(question string) bool {
 	return false
 }
 
-// requireConsole reads the console and refuses an instance that has none to
-// drive, having already said why; cons is nil and code is the exit status.
+// requireConsole reads the console and refuses an instance that manages no
+// workloads at all, having already said why; cons is nil and code is the exit
+// status. An instance without an operator resource — direct mode — is a
+// console all the same: the portal restarts and scales its Deployments
+// themselves.
 func requireConsole(ctx context.Context, c *client, base string) (cons *Console, code int) {
 	cons, _, err := c.console(ctx)
 	if err != nil {
 		return nil, fail(err)
 	}
-	if !cons.offered() {
+	if !cons.Available {
 		errf("not offered: %s", cons.noConsole(base))
+		return nil, exitcode.NotOffered
+	}
+	return cons, exitcode.OK
+}
+
+// requireOperator is requireConsole for what only the operator's resource
+// holds — the version, the channel, the update mode, the verification — and
+// so refuses direct mode too, naming what does change such an instance.
+func requireOperator(ctx context.Context, c *client, base, doing string) (cons *Console, code int) {
+	cons, code = requireConsole(ctx, c, base)
+	if cons == nil {
+		return nil, code
+	}
+	if !cons.offered() {
+		errf("not offered: %s — %s changes the operator's resource, and there is none: its workloads are updated through whatever deploys them", cons.noConsole(base), doing)
 		return nil, exitcode.NotOffered
 	}
 	return cons, exitcode.OK
@@ -271,7 +293,7 @@ func status(args []string) int {
 		// script should read the API's shape rather than zae's view of it.
 		fmt.Fprintln(stdout, strings.TrimSpace(string(raw)))
 	}
-	if !cons.offered() {
+	if !cons.Available {
 		errf("not offered: %s", cons.noConsole(base))
 		return exitcode.NotOffered
 	}
@@ -379,7 +401,7 @@ func update(args []string) int {
 
 	ctx := context.Background()
 	c := newClient(base)
-	cons, code := requireConsole(ctx, c, base)
+	cons, code := requireOperator(ctx, c, base, "zae platform update")
 	if cons == nil {
 		return code
 	}

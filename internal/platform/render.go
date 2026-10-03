@@ -22,6 +22,10 @@ const controllerUnreported = "not reported by this operator, so zae cannot say w
 // of all this that the platform does not update: its own controller.
 func renderStatus(w io.Writer, base string, c *Console) {
 	op := c.Operator
+	if c.direct() {
+		renderDirect(w, base, c)
+		return
+	}
 	fmt.Fprintf(w, "%s — the platform\n", base)
 	label(w, "version", versionLine(op))
 	label(w, "channel", dash(op.Channel))
@@ -44,6 +48,22 @@ func renderStatus(w io.Writer, base string, c *Console) {
 	renderWorkloads(w, c)
 	fmt.Fprintln(w)
 	renderController(w, controllerHeading, op.Controller)
+}
+
+// renderDirect prints an instance whose portal manages the workloads without
+// an operator — direct mode, as the console calls it: there is no version,
+// channel, verification or controller to show, only the workloads, which
+// restart and scale act on directly.
+func renderDirect(w io.Writer, base string, c *Console) {
+	fmt.Fprintf(w, "%s — the platform · direct mode\n", base)
+	note := strings.TrimSpace(c.Operator.Note)
+	if note == "" {
+		note = "no operator detected"
+	}
+	label(w, "operator", "none — "+note)
+	fmt.Fprintf(w, "  %-13s%s\n", "", "restart and scale act on the Deployments directly; update and verify need an operator")
+	fmt.Fprintln(w)
+	renderWorkloads(w, c)
 }
 
 // verificationLine is the platform's last check of itself, on one line: how

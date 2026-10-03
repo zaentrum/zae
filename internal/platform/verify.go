@@ -45,7 +45,7 @@ func verify(args []string) int {
 
 	ctx := context.Background()
 	c := newClient(base)
-	cons, code := requireConsole(ctx, c, base)
+	cons, code := requireOperator(ctx, c, base, "zae platform verify")
 	if cons == nil {
 		return code
 	}

@@ -188,7 +188,7 @@ func workloadSettled(name string, want int, r rollout) settle {
 	return func(c *Console) (bool, string) {
 		w := c.find(name)
 		switch {
-		case !c.offered():
+		case !c.Available:
 			return false, c.noConsole("the instance")
 		case w == nil:
 			return false, name + " is no longer among the instance's workloads"

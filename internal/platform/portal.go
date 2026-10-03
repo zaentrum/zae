@@ -274,10 +274,16 @@ type updated struct {
 	Generation int64  `json:"generation"`
 }
 
-// offered reports whether this instance has an operator console to drive.
-// Both halves must hold: the portal must be able to reach a cluster at all,
-// and that cluster must hold the resource the platform is declared in.
+// offered reports whether this instance has an operator to drive. Both halves
+// must hold: the portal must be able to reach a cluster at all, and that
+// cluster must hold the resource the platform is declared in. Without the
+// second the console still lists, restarts and scales the workloads — direct
+// mode — and only what the resource holds is missing.
 func (c *Console) offered() bool { return c.Available && c.Operator.Present }
+
+// direct reports whether the portal manages the workloads without an
+// operator: it acts on the Deployments themselves.
+func (c *Console) direct() bool { return c.Available && !c.Operator.Present }
 
 // noConsole says why there is nothing to drive, in the portal's own words.
 func (c *Console) noConsole(base string) string {
@@ -288,7 +294,7 @@ func (c *Console) noConsole(base string) string {
 	if !c.Available {
 		return fmt.Sprintf("%s does not manage its own workloads: %s", base, note)
 	}
-	return fmt.Sprintf("%s is not managed by the operator: %s — `zae platform` drives the operator's resource, and this instance has none", base, note)
+	return fmt.Sprintf("%s runs in direct mode, without an operator (%s)", base, note)
 }
 
 // find returns the workload by name, or nil.

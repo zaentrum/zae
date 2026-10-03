@@ -524,40 +524,106 @@ func TestStatusRendersThePlatformAndItsWorkloads(t *testing.T) {
 	}
 }
 
-// Both halves of "there is nothing to drive" — a portal that manages no
-// workloads, and one that does but has no operator resource — exit 3 and say
-// which, in the portal's own words.
+// A portal that manages no workloads at all — not running in a cluster —
+// exits 3, in the portal's own words.
 func TestStatusWithoutAnOperatorConsole(t *testing.T) {
-	for name, setup := range map[string]struct {
-		prepare func(p *fakePortal)
-		want    string
-	}{
-		"not in a cluster": {func(p *fakePortal) { p.available = false }, noManagement},
-		"no operator": {func(p *fakePortal) {
-			p.op = Operator{Present: false, Note: "no operator detected — managing deployments directly"}
-		}, "no operator detected"},
-	} {
-		p, srv := newPortal(t)
-		setup.prepare(p)
-		code, out, errs := run(t, "", false, "status", "--url", srv.URL)
-		if code != exitcode.NotOffered {
-			t.Errorf("%s: want 3, got %d\n%s\n%s", name, code, out, errs)
-		}
-		if !strings.Contains(errs, "not offered:") || !strings.Contains(errs, setup.want) {
-			t.Errorf("%s: the note must be printed, got %q", name, errs)
-		}
-		if strings.Contains(out, "NAME") {
-			t.Errorf("%s: no table without a console:\n%s", name, out)
-		}
+	p, srv := newPortal(t)
+	p.available = false
+	code, out, errs := run(t, "", false, "status", "--url", srv.URL)
+	if code != exitcode.NotOffered {
+		t.Errorf("want 3, got %d\n%s\n%s", code, out, errs)
+	}
+	if !strings.Contains(errs, "not offered:") || !strings.Contains(errs, noManagement) {
+		t.Errorf("the note must be printed, got %q", errs)
+	}
+	if strings.Contains(out, "NAME") {
+		t.Errorf("no table without a console:\n%s", out)
+	}
 
-		// --json still prints the portal's document, and still exits 3.
-		code, out, _ = run(t, "", false, "status", "--url", srv.URL, "--json")
-		if code != exitcode.NotOffered {
-			t.Errorf("%s --json: want 3, got %d", name, code)
+	// --json still prints the portal's document, and still exits 3.
+	code, out, _ = run(t, "", false, "status", "--url", srv.URL, "--json")
+	if code != exitcode.NotOffered {
+		t.Errorf("--json: want 3, got %d", code)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Errorf("--json: not JSON: %v (%q)", err, out)
+	}
+}
+
+// directMode is a portal in a cluster with no operator resource: it lists
+// the namespace's Deployments, and restarts and scales them itself.
+func directMode(p *fakePortal) {
+	p.op = Operator{Present: false, Note: "no operator detected — managing deployments directly"}
+	for i := range p.workloads {
+		p.workloads[i].OperatorManaged = false
+		if p.workloads[i].Group == GroupPlatform {
+			p.workloads[i].Group = GroupOther
 		}
-		var doc map[string]any
-		if err := json.Unmarshal([]byte(out), &doc); err != nil {
-			t.Errorf("%s --json: not JSON: %v (%q)", name, err, out)
+	}
+}
+
+// Direct mode is the console all the same — the portal acts on the
+// Deployments themselves — so status shows the workloads, and restart and
+// scale go through. Only what the operator's resource holds is missing.
+func TestDirectMode(t *testing.T) {
+	p, srv := newPortal(t)
+	directMode(p)
+	code, out, errs := run(t, "", false, "status", "--url", srv.URL)
+	if code != exitcode.OK {
+		t.Fatalf("status in direct mode: want 0, got %d\n%s\n%s", code, out, errs)
+	}
+	for _, s := range []string{
+		srv.URL + " — the platform · direct mode",
+		"operator     none — no operator detected — managing deployments directly",
+		"restart and scale act on the Deployments directly",
+		"NAME", "chino-api",
+	} {
+		if !strings.Contains(out, s) {
+			t.Errorf("status lacks %q:\n%s", s, out)
+		}
+	}
+	for _, s := range []string{"version ", "verified", "the operator's controller"} {
+		if strings.Contains(out, s) {
+			t.Errorf("there is no operator to report %q of:\n%s", s, out)
+		}
+	}
+	if code, out, _ := run(t, "", false, "status", "--url", srv.URL, "--json"); code != exitcode.OK || !strings.Contains(out, `"present":false`) {
+		t.Errorf("--json in direct mode: want 0 and the portal's document, got %d %q", code, out)
+	}
+
+	if code, out, errs := run(t, "", false, "restart", "chino-api", "--url", srv.URL, "--yes"); code != exitcode.OK || p.called("POST "+operatorPath+"/instances/chino-api/restart") != 1 {
+		t.Fatalf("restart in direct mode: want 0 and one restart, got %d\n%s\n%s", code, out, errs)
+	}
+	if code, out, errs := run(t, "", false, "scale", "chino-api", "3", "--url", srv.URL, "--yes"); code != exitcode.OK || p.called("POST "+operatorPath+"/instances/chino-api/scale") != 1 {
+		t.Fatalf("scale in direct mode: want 0 and one scale, got %d\n%s\n%s", code, out, errs)
+	}
+	// A wait follows the Deployment as it would with an operator.
+	restarted := 0
+	p.onWrite = func(p *fakePortal) { restarted = p.reads }
+	p.onGet = func(p *fakePortal, n int) {
+		if restarted > 0 && n > restarted+1 {
+			p.ready()
+		}
+	}
+	if code, out, errs := run(t, "", false, "restart", "chino-api", "--url", srv.URL, "--yes", "--wait", "--timeout", "10s"); code != exitcode.OK || !strings.Contains(out, "chino-api is ready") {
+		t.Fatalf("restart --wait in direct mode: want 0, got %d\n%s\n%s", code, out, errs)
+	}
+
+	writes := len(p.calls)
+	for _, args := range [][]string{
+		{"update", "--url", srv.URL, "--mode", "auto", "--yes"},
+		{"verify", "--url", srv.URL, "--yes"},
+		{"controller", "--url", srv.URL},
+	} {
+		code, _, errs := run(t, "", false, args...)
+		if code != exitcode.NotOffered || !strings.Contains(errs, "direct mode") {
+			t.Errorf("%v in direct mode: want 3 naming direct mode, got %d %q", args, code, errs)
+		}
+	}
+	for _, c := range p.calls[writes:] {
+		if !strings.HasPrefix(c, "GET ") {
+			t.Fatalf("nothing is written without an operator to write to: %v", p.calls[writes:])
 		}
 	}
 }
