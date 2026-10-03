@@ -91,8 +91,12 @@ func (e *Error) Unwrap() error {
 // Endpoints is the part of an issuer's metadata zae uses.
 type Endpoints struct {
 	Issuer string
-	Device string
-	Token  string
+	// Authorization is where a browser is sent to sign in — the start of the
+	// authorization code flow, which `zae doctor --sign-in` walks the way a
+	// person does.
+	Authorization string
+	Device        string
+	Token         string
 }
 
 // Client talks to one issuer. The zero value works; Sleep is a seam for tests
@@ -125,10 +129,26 @@ func (c *Client) sleep(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// Discover reads the issuer's metadata. The device endpoint being absent is
-// its own error: it is the one failure an operator can fix, and saying
-// "unreachable" for it would send them looking at the network instead.
+// Discover reads the issuer's metadata for the device grant. The device
+// endpoint being absent is its own error: it is the one failure an operator
+// can fix, and saying "unreachable" for it would send them looking at the
+// network instead.
 func (c *Client) Discover(ctx context.Context, issuer string) (*Endpoints, error) {
+	ep, err := c.Metadata(ctx, issuer)
+	if err != nil {
+		return nil, err
+	}
+	if ep.Device == "" {
+		return nil, fmt.Errorf("%w: %s", ErrNoDeviceGrant, strings.TrimRight(issuer, "/"))
+	}
+	return ep, nil
+}
+
+// Metadata reads the issuer's metadata without asking for any one grant: a
+// token endpoint is all every flow shares. The device grant needs its own
+// endpoint and the code flow its authorization endpoint; each caller checks
+// for the one it uses, so that the absence is named for what it stops.
+func (c *Client) Metadata(ctx context.Context, issuer string) (*Endpoints, error) {
 	issuer = strings.TrimRight(issuer, "/")
 	if issuer == "" {
 		return nil, fmt.Errorf("%w: no issuer to ask", ErrUnreachable)
@@ -147,9 +167,10 @@ func (c *Client) Discover(ctx context.Context, issuer string) (*Endpoints, error
 		return nil, fmt.Errorf("%w: %s%s answered %d", ErrUnreachable, issuer, wellKnown, resp.StatusCode)
 	}
 	var meta struct {
-		Issuer string `json:"issuer"`
-		Device string `json:"device_authorization_endpoint"`
-		Token  string `json:"token_endpoint"`
+		Issuer        string `json:"issuer"`
+		Authorization string `json:"authorization_endpoint"`
+		Device        string `json:"device_authorization_endpoint"`
+		Token         string `json:"token_endpoint"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&meta); err != nil {
 		return nil, fmt.Errorf("%w: %s%s did not answer OpenID metadata (%v)", ErrUnreachable, issuer, wellKnown, err)
@@ -157,13 +178,10 @@ func (c *Client) Discover(ctx context.Context, issuer string) (*Endpoints, error
 	if meta.Token == "" {
 		return nil, fmt.Errorf("%w: %s%s advertises no token_endpoint", ErrUnreachable, issuer, wellKnown)
 	}
-	if meta.Device == "" {
-		return nil, fmt.Errorf("%w: %s", ErrNoDeviceGrant, issuer)
-	}
 	if meta.Issuer == "" {
 		meta.Issuer = issuer
 	}
-	return &Endpoints{Issuer: meta.Issuer, Device: meta.Device, Token: meta.Token}, nil
+	return &Endpoints{Issuer: meta.Issuer, Authorization: meta.Authorization, Device: meta.Device, Token: meta.Token}, nil
 }
 
 // Device is one authorization in flight. The device code and the PKCE
@@ -243,15 +261,19 @@ func (c *Client) Authorize(ctx context.Context, ep *Endpoints, clientID, scope s
 type Token struct {
 	AccessToken  string
 	RefreshToken string
-	TokenType    string
-	Scope        string
-	Expiry       time.Time
+	// IDToken is what an OpenID provider says about the sign-in itself; only
+	// the code flow asks for it.
+	IDToken   string
+	TokenType string
+	Scope     string
+	Expiry    time.Time
 }
 
 // tokenResponse is the wire shape of a successful token answer.
 type tokenResponse struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
+	IDToken      string `json:"id_token"`
 	TokenType    string `json:"token_type"`
 	Scope        string `json:"scope"`
 	ExpiresIn    int    `json:"expires_in"`
@@ -261,6 +283,7 @@ func (t tokenResponse) token() *Token {
 	out := &Token{
 		AccessToken:  t.AccessToken,
 		RefreshToken: t.RefreshToken,
+		IDToken:      t.IDToken,
 		TokenType:    t.TokenType,
 		Scope:        t.Scope,
 	}
@@ -414,6 +437,11 @@ type Claims struct {
 	Username string
 	Roles    []string
 	Expiry   time.Time
+	// Issuer and Audience are what an API compares with its own configuration
+	// before it accepts the token: the doctor reads them to say which half of
+	// that comparison a refusal would come from.
+	Issuer   string
+	Audience []string
 }
 
 // HasRole reports whether the token carries the named realm role.
@@ -442,9 +470,11 @@ func ParseClaims(token string) (*Claims, bool) {
 		return nil, false
 	}
 	var raw struct {
-		Sub               string `json:"sub"`
-		PreferredUsername string `json:"preferred_username"`
-		Exp               int64  `json:"exp"`
+		Sub               string   `json:"sub"`
+		PreferredUsername string   `json:"preferred_username"`
+		Exp               int64    `json:"exp"`
+		Iss               string   `json:"iss"`
+		Aud               audience `json:"aud"`
 		RealmAccess       struct {
 			Roles []string `json:"roles"`
 		} `json:"realm_access"`
@@ -452,9 +482,46 @@ func ParseClaims(token string) (*Claims, bool) {
 	if err := json.Unmarshal(payload, &raw); err != nil {
 		return nil, false
 	}
-	c := &Claims{Subject: raw.Sub, Username: raw.PreferredUsername, Roles: raw.RealmAccess.Roles}
+	c := &Claims{Subject: raw.Sub, Username: raw.PreferredUsername, Roles: raw.RealmAccess.Roles,
+		Issuer: raw.Iss, Audience: raw.Aud}
 	if raw.Exp > 0 {
 		c.Expiry = time.Unix(raw.Exp, 0)
 	}
 	return c, true
 }
+
+// audience is a JWT's `aud`: one string or an array of them (RFC 7519 §4.1.3),
+// read as the array either way. Any other shape reads as no audience rather
+// than as an unreadable token: the rest of the claims are still worth showing.
+type audience []string
+
+func (a *audience) UnmarshalJSON(b []byte) error {
+	var one string
+	if err := json.Unmarshal(b, &one); err == nil {
+		*a = nil
+		if one != "" {
+			*a = audience{one}
+		}
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(b, &many); err != nil {
+		*a = nil
+		return nil
+	}
+	*a = many
+	return nil
+}
+
+// has reports whether the audience names id.
+func (a audience) has(id string) bool {
+	for _, v := range a {
+		if v == id {
+			return true
+		}
+	}
+	return false
+}
+
+// HasAudience reports whether the token names id among its audiences.
+func (c *Claims) HasAudience(id string) bool { return c != nil && audience(c.Audience).has(id) }
