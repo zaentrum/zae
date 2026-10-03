@@ -1,6 +1,8 @@
 // Package oidc is exactly as much of OAuth 2.0 as a terminal needs: the
-// Device Authorization Grant (RFC 8628) with PKCE (RFC 7636), a refresh, and
-// a look at an access token's own claims so `zae whoami` can say who you are.
+// Device Authorization Grant (RFC 8628) with PKCE (RFC 7636), a refresh, a
+// revocation (RFC 7009) so that signing out ends the session where it lives,
+// and a look at an access token's own claims so `zae whoami` can say who you
+// are when the instance cannot.
 //
 // Three rules shape it:
 //
@@ -53,6 +55,10 @@ var (
 	ErrDenied = errors.New("authorization denied")
 	// ErrCodeExpired: the user code was not used in time.
 	ErrCodeExpired = errors.New("the code expired before it was used")
+	// ErrNoRevocation: the issuer answered, and advertises no revocation
+	// endpoint (RFC 7009). A token it issued cannot be ended early; it stays
+	// valid until it expires.
+	ErrNoRevocation = errors.New("the issuer advertises no revocation endpoint")
 )
 
 // Error is what an OAuth endpoint answered (RFC 6749 §5.2): the
@@ -97,6 +103,9 @@ type Endpoints struct {
 	Authorization string
 	Device        string
 	Token         string
+	// Revocation is where a token is ended before it expires (RFC 7009), ""
+	// when the issuer offers no such thing.
+	Revocation string
 }
 
 // Client talks to one issuer. The zero value works; Sleep is a seam for tests
@@ -171,6 +180,7 @@ func (c *Client) Metadata(ctx context.Context, issuer string) (*Endpoints, error
 		Authorization string `json:"authorization_endpoint"`
 		Device        string `json:"device_authorization_endpoint"`
 		Token         string `json:"token_endpoint"`
+		Revocation    string `json:"revocation_endpoint"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&meta); err != nil {
 		return nil, fmt.Errorf("%w: %s%s did not answer OpenID metadata (%v)", ErrUnreachable, issuer, wellKnown, err)
@@ -181,7 +191,8 @@ func (c *Client) Metadata(ctx context.Context, issuer string) (*Endpoints, error
 	if meta.Issuer == "" {
 		meta.Issuer = issuer
 	}
-	return &Endpoints{Issuer: meta.Issuer, Authorization: meta.Authorization, Device: meta.Device, Token: meta.Token}, nil
+	return &Endpoints{Issuer: meta.Issuer, Authorization: meta.Authorization, Device: meta.Device, Token: meta.Token,
+		Revocation: meta.Revocation}, nil
 }
 
 // Device is one authorization in flight. The device code and the PKCE
@@ -356,8 +367,29 @@ func (c *Client) Refresh(ctx context.Context, ep *Endpoints, clientID, refreshTo
 	return t, nil
 }
 
-// post sends a form and decodes the answer, turning an OAuth error body into
-// an *Error and anything unreadable into ErrUnreachable.
+// Revoke asks the issuer to end a token before it expires (RFC 7009): a
+// refresh token, whose revocation ends the session it belongs to, or an
+// access token. hint names which ("refresh_token", "access_token") and may be
+// empty. A public client authenticates by naming itself.
+//
+// The issuer answers 200 whether it revoked the token or the token was no
+// longer valid — both end where the caller wanted to be — and nil means that.
+// An issuer without a revocation endpoint is ErrNoRevocation, an OAuth error
+// an *Error, and no usable answer ErrUnreachable.
+func (c *Client) Revoke(ctx context.Context, ep *Endpoints, clientID, token, hint string) error {
+	if ep.Revocation == "" {
+		return fmt.Errorf("%w: %s", ErrNoRevocation, strings.TrimRight(ep.Issuer, "/"))
+	}
+	form := url.Values{"token": {token}, "client_id": {clientID}}
+	if hint != "" {
+		form.Set("token_type_hint", hint)
+	}
+	return c.post(ctx, ep.Revocation, form, nil)
+}
+
+// post sends a form and decodes the answer into out — when out is nil, a 2xx
+// is all the answer there is — turning an OAuth error body into an *Error and
+// anything unreadable into ErrUnreachable.
 func (c *Client) post(ctx context.Context, endpoint string, form url.Values, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
@@ -373,6 +405,9 @@ func (c *Client) post(ctx context.Context, endpoint string, form url.Values, out
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if out == nil {
+			return nil
+		}
 		if err := json.Unmarshal(body, out); err != nil {
 			return fmt.Errorf("%w: %s answered %d with something that is not JSON", ErrUnreachable, endpoint, resp.StatusCode)
 		}

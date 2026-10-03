@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -107,6 +108,55 @@ func TestRefreshKeepsANonRotatedRefreshToken(t *testing.T) {
 	}
 	if tok.Expiry.IsZero() || !tok.Expiry.After(time.Now()) {
 		t.Fatalf("expiry must be absolute and in the future: %+v", tok)
+	}
+}
+
+// Revocation (RFC 7009): the endpoint is read from the metadata like every
+// other one, the request names the token, its kind and the public client,
+// and any 200 — revoked, or no longer valid — is success.
+func TestRevoke(t *testing.T) {
+	var srv *httptest.Server
+	var sent url.Values
+	status, answer := http.StatusOK, ""
+	mux := http.NewServeMux()
+	mux.HandleFunc("/realms/z/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"issuer":%q,"token_endpoint":%q,"revocation_endpoint":%q}`,
+			srv.URL+"/realms/z", srv.URL+"/realms/z/token", srv.URL+"/elsewhere/revoke")
+	})
+	mux.HandleFunc("/elsewhere/revoke", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		sent = r.PostForm
+		w.WriteHeader(status)
+		fmt.Fprint(w, answer)
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+	c := &Client{}
+	ep, err := c.Metadata(context.Background(), srv.URL+"/realms/z")
+	if err != nil || ep.Revocation != srv.URL+"/elsewhere/revoke" {
+		t.Fatalf("the revocation endpoint is read, not built: %+v %v", ep, err)
+	}
+	if err := c.Revoke(context.Background(), ep, "zae", "the-refresh-token", "refresh_token"); err != nil {
+		t.Fatalf("an empty 200 is success: %v", err)
+	}
+	if sent.Get("token") != "the-refresh-token" || sent.Get("token_type_hint") != "refresh_token" || sent.Get("client_id") != "zae" {
+		t.Fatalf("the request: %v", sent)
+	}
+
+	status, answer = http.StatusBadRequest, `{"error":"unsupported_token_type","error_description":"Unsupported token type"}`
+	var oe *Error
+	if err := c.Revoke(context.Background(), ep, "zae", "t", ""); !errors.As(err, &oe) || oe.Code != "unsupported_token_type" {
+		t.Fatalf("an OAuth refusal is an *Error: %v", err)
+	}
+	if sent.Has("token_type_hint") {
+		t.Errorf("no hint asked for, none sent: %v", sent)
+	}
+	status, answer = http.StatusServiceUnavailable, "<html>maintenance</html>"
+	if err := c.Revoke(context.Background(), ep, "zae", "t", ""); !errors.Is(err, ErrUnreachable) {
+		t.Fatalf("a page that is not OAuth is unreachable: %v", err)
+	}
+	if err := c.Revoke(context.Background(), &Endpoints{Issuer: "https://idp.example.org/"}, "zae", "t", ""); !errors.Is(err, ErrNoRevocation) {
+		t.Fatalf("no endpoint: want ErrNoRevocation, got %v", err)
 	}
 }
 
