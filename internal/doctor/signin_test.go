@@ -34,10 +34,16 @@ func TestSignInWithAPasswordTheWayAPersonDoes(t *testing.T) {
 			t.Errorf("%s: want ✓, got %q (%s)\n%s", name, m, line(out, name), out)
 		}
 	}
-	// The launchpad decides which apps are checked: a disabled tile, a link
-	// to another site and a page inside the portal add nothing.
-	if strings.Contains(out, "app /tv/") || strings.Contains(out, "docs.example.org") || strings.Count(out, "app /portal/") != 1 {
-		t.Errorf("the apps checked are the launchpad's open, local mounts, once each:\n%s", out)
+	// The launchpad decides which apps are checked: a disabled tile, an
+	// external one, a link to another site and a page inside the portal add
+	// nothing.
+	for _, not := range []string{"app /tv/", "app /handbook/", "app /app/", "docs.example.org", "partner.example.org"} {
+		if strings.Contains(out, not) {
+			t.Errorf("%q is not one of the launchpad's open, local apps:\n%s", not, out)
+		}
+	}
+	if strings.Count(out, "app /portal/") != 1 {
+		t.Errorf("each mount is checked once:\n%s", out)
 	}
 	// What a browser sends: the hidden input of the form, and nothing it
 	// would not — the unchecked "remember me" stays unchecked.
@@ -361,5 +367,44 @@ func TestAnInstanceThatAdvertisesNoWebClient(t *testing.T) {
 	}
 	if !strings.Contains(line(out, "signed-in checks"), "does not say where to sign in") {
 		t.Errorf("what did not run is said:\n%s", out)
+	}
+}
+
+// A sign-in stays inside the identity provider: a redirect anywhere but the
+// provider itself or the web client ends it, and the login session's cookies
+// go nowhere else.
+func TestASignInStaysInsideTheIdentityProvider(t *testing.T) {
+	var got []string
+	elsewhere := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		got = append(got, r.Method+" "+r.URL.Path)
+	}))
+	defer elsewhere.Close()
+	w := newWorld(t)
+	w.authRedirect = elsewhere.URL + "/broker/login"
+	signedIn(t)
+	code, out, _ := doctor(t, "--url", w.srv.URL, "--sign-in")
+	if code != 1 || mark(out, "sign-in: authorization") != "✗" {
+		t.Fatalf("want the authorization step to fail, got %d\n%s", code, out)
+	}
+	if !strings.Contains(line(out, "sign-in: authorization"), "neither the identity provider nor the web client") {
+		t.Errorf("the line says where it was sent: %s", line(out, "sign-in: authorization"))
+	}
+	if len(got) != 0 {
+		t.Fatalf("the redirect out of the identity provider was followed: %v", got)
+	}
+}
+
+// A login form that is sent with GET would put the password in an address —
+// and so in every log the address passes through. It is not sent.
+func TestALoginFormThatWouldPutThePasswordInAnAddress(t *testing.T) {
+	w := newWorld(t)
+	w.formMethod = "get"
+	signedIn(t)
+	code, out, _ := doctor(t, "--url", w.srv.URL, "--sign-in")
+	if code != 1 || !strings.Contains(line(out, "sign-in: login form"), "would put the password in an address") {
+		t.Fatalf("want the form step to refuse, got %d\n%s", code, out)
+	}
+	if w.called("GET "+realmPath+"/login-actions") != 0 || w.called("POST "+realmPath+"/login-actions") != 0 {
+		t.Fatalf("the form was sent: %v", w.requests)
 	}
 }

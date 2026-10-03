@@ -212,3 +212,33 @@ func TestTheReportOfASignedInRun(t *testing.T) {
 		t.Fatalf("the report: %+v", doc)
 	}
 }
+
+// "<" stays "<": escaped it costs six bytes of a budget that has none to
+// spare. And a cut never falls inside a character — not even where every
+// character is more than one byte.
+func TestReportSpendsItsBytesOnText(t *testing.T) {
+	b := buildReport("dev", "https://media.example.org", []Result{
+		{Name: "app /chino/", Status: Fail, Detail: "answered <html> & a page"},
+	})
+	if !strings.Contains(string(b), `"answered <html> & a page"`) {
+		t.Fatalf("the detail was escaped: %s", b)
+	}
+	wide := strings.Repeat("ü", 2000)
+	var results []Result
+	for i := 0; i < 40; i++ {
+		results = append(results, Result{Name: fmt.Sprintf("c%02d", i), Status: Fail, Detail: wide})
+	}
+	b = buildReport("dev", "https://media.example.org", results)
+	if strings.Contains(string(b), "\uFFFD") || !utf8.Valid(b) {
+		t.Fatalf("a cut fell inside a character: %q", b[:200])
+	}
+	var doc reportDoc
+	if err := json.Unmarshal(b, &doc); err != nil || len(doc.Checks) != 40 {
+		t.Fatalf("every failure, as JSON: %v, %d", err, len(doc.Checks))
+	}
+	for _, c := range doc.Checks {
+		if d := strings.TrimSuffix(c.D, "…"); strings.Trim(d, "ü") != "" {
+			t.Fatalf("a detail cut to something else than its own characters: %q", c.D)
+		}
+	}
+}

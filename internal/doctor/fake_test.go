@@ -49,6 +49,8 @@ type world struct {
 	requiredFor   string // a required action pending: UPDATE_PASSWORD, VERIFY_PROFILE, …
 	otp           bool   // a second factor after the password
 	formAction    string // where the login form posts, when not to the provider itself
+	formMethod    string // how it posts, when not with POST
+	authRedirect  string // where the authorization endpoint redirects instead of answering
 	pending       map[string]authRequest
 	codes         map[string]authRequest
 	metaIssuer    string // the issuer the metadata names, when not the realm's own URL
@@ -71,6 +73,7 @@ type world struct {
 	posters      map[string]bool
 	portraits    map[string]bool
 	packaged     []string
+	peopleTotal  *int            // a total other than the list's length
 	gone         map[string]bool // listed as packaged, and the package is not on disk
 	masterCaps   string
 	items        func(w http.ResponseWriter, r *http.Request) bool // overrides /api/v1/items when it answers true
@@ -232,7 +235,7 @@ const loginPage = `<!DOCTYPE html>
 <script>var notAForm = "<form action='/elsewhere'>";</script></head>
 <body><main class="auth"><div class="card"><h1>sign in</h1>
 %s
-<form id="kc-form-login" action="%s" method="post" autocomplete="off" novalidate>
+<form id="kc-form-login" action="%s" method="%s" autocomplete="off" novalidate>
   <label for="username">Username or email</label>
   <input id="username" name="username" type="text" autofocus value="" dir="ltr">
   <label for="password">Password</label>
@@ -252,6 +255,11 @@ const errorPage = `<!DOCTYPE html><html><head><title>Sign in to zaentrum</title>
 
 func (w *world) authorize(rw http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
+	if w.authRedirect != "" {
+		http.SetCookie(rw, &http.Cookie{Name: "AUTH_SESSION_ID", Value: "s-outside", Path: "/"})
+		http.Redirect(rw, r, w.authRedirect, http.StatusFound)
+		return
+	}
 	if !w.clients[q.Get("client_id")] {
 		rw.WriteHeader(http.StatusBadRequest)
 		fmt.Fprintf(rw, errorPage, "Client not found.")
@@ -286,8 +294,12 @@ func (w *world) loginForm(rw http.ResponseWriter, session, alert string) {
 	if alert != "" {
 		alert = `<div class="alert error" role="alert">` + alert + `</div>`
 	}
+	method := "post"
+	if w.formMethod != "" {
+		method = w.formMethod
+	}
 	rw.Header().Set("Content-Type", "text/html;charset=utf-8")
-	fmt.Fprintf(rw, loginPage, alert, html.EscapeString(action),
+	fmt.Fprintf(rw, loginPage, alert, html.EscapeString(action), method,
 		html.EscapeString(realmPath+"/login-actions/reset-credentials?client_id="+webClient+"&tab_id=t1"))
 }
 
@@ -448,12 +460,15 @@ func (w *world) api(rw http.ResponseWriter, r *http.Request) {
 		writeJSON(rw, map[string]any{"spaces": []map[string]any{
 			{"key": "apps", "tiles": []map[string]any{
 				{"key": "chino.open", "href": "/chino/"},
-				{"key": "tv.open", "href": "", "disabled": true},
+				{"key": "tv.open", "href": "/tv/", "disabled": true},
+				{"key": "musig.open", "href": "", "disabled": true},
 			}},
 			{"key": "manage", "tiles": []map[string]any{
 				{"key": "katalog.catalog", "href": "/katalog/"},
 				{"key": "sample.open", "href": "/portal/app/sample"},
 				{"key": "docs", "href": "https://docs.example.org/", "external": true},
+				{"key": "handbook", "href": "/handbook/", "external": true},
+				{"key": "partner.open", "href": "https://partner.example.org/app/"},
 			}},
 		}})
 	case p == consoleAPI:
@@ -477,7 +492,11 @@ func (w *world) api(rw http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(rw, map[string]any{"product": "chino", "items": list, "source": "katalog"})
 	case p == peoplePath:
-		writeJSON(rw, map[string]any{"people": w.people, "total": len(w.people)})
+		total := len(w.people)
+		if w.peopleTotal != nil {
+			total = *w.peopleTotal
+		}
+		writeJSON(rw, map[string]any{"people": w.people, "total": total})
 	case p == packagedPath:
 		writeJSON(rw, map[string]any{"ids": w.packaged})
 	case strings.HasPrefix(p, itemsPath+"/"):

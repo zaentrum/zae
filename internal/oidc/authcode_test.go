@@ -201,6 +201,9 @@ func TestCheckIDToken(t *testing.T) {
 		if tc.claim == "iss" && !strings.Contains(err.Error(), iss) {
 			t.Errorf("%s: the message names the issuer expected: %v", name, err)
 		}
+		if name == "no expiry" && !strings.Contains(err.Error(), "carries no expiry") {
+			t.Errorf("%s: a token without an expiry is not one that expired in year 1: %v", name, err)
+		}
 	}
 	for _, bad := range []string{"", "opaque", "a.!!!.c", "a." + base64.RawURLEncoding.EncodeToString([]byte("[")) + ".c"} {
 		if _, err := a.CheckIDToken(bad, iss, now); err == nil {

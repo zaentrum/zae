@@ -94,6 +94,10 @@ func TestStatusShowsTheLastVerification(t *testing.T) {
 					t.Errorf("status lacks %q:\n%s", w, out)
 				}
 			}
+			// Under a failed run's line are its failures, and nothing else.
+			if strings.Contains(out, "tls — certificate valid") {
+				t.Errorf("a passing check is listed under the line:\n%s", out)
+			}
 			// The line sits with the platform's own state, before the workloads.
 			if i, j := strings.Index(out, "  verified "), strings.Index(out, "NAME"); i < 0 || i > j {
 				t.Errorf("the verified line belongs to the platform's section:\n%s", out)

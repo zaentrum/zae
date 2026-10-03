@@ -86,6 +86,8 @@ func TestDeepChecksCatchWhatTheyAreFor(t *testing.T) {
 			w.persons["p1"]["has_profile"] = false
 			delete(w.persons["p1"], "profile_url")
 		}, "chino-api: portrait", "-", "has no portrait", ""},
+		{"a people total that is not the list's", func(w *world) { n := 7; w.peopleTotal = &n },
+			"chino-api: people search", "✗", "total says 7, and the list holds 1", "length of the list"},
 		{"a credited person the search cannot find", func(w *world) { w.people = []map[string]any{} },
 			"chino-api: people search", "!", "does not find them", "name index"},
 		{"an app whose bundle is missing behind a single-page fallback", func(w *world) {
