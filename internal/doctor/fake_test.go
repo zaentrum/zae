@@ -282,7 +282,9 @@ func (w *world) authorize(rw http.ResponseWriter, r *http.Request) {
 	w.pending[session] = authRequest{clientID: q.Get("client_id"), redirectURI: q.Get("redirect_uri"),
 		state: q.Get("state"), nonce: q.Get("nonce"), challenge: q.Get("code_challenge")}
 	w.mu.Unlock()
-	http.SetCookie(rw, &http.Cookie{Name: "AUTH_SESSION_ID", Value: session, Path: realmPath + "/"})
+	// As Keycloak 26 sets it, over plain http too: Secure, SameSite=None.
+	http.SetCookie(rw, &http.Cookie{Name: "AUTH_SESSION_ID", Value: session, Path: realmPath + "/",
+		Secure: true, HttpOnly: true, SameSite: http.SameSiteNoneMode})
 	w.loginForm(rw, session, "")
 }
 

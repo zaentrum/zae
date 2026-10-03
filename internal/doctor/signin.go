@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -397,9 +398,48 @@ func newBrowser(idp *url.URL, ac *oidc.AuthCode, agent string) *browser {
 	jar, _ := cookiejar.New(nil)
 	return &browser{idp: idp, ac: ac, agent: agent, http: &http.Client{
 		Timeout:       requestTimeout,
-		Jar:           jar,
+		Jar:           secureContextJar{jar},
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}}
+}
+
+// secureContextJar keeps cookies the way a browser does. A browser counts
+// http://localhost and every name under .localhost as potentially trustworthy
+// (W3C Secure Contexts) and sends them the cookies marked Secure — and
+// Keycloak marks its login session's cookies Secure (SameSite=None) even over
+// plain http. Go's jar sends a Secure cookie over https only, so without this
+// a sign-in to http://zaentrum.localhost, which a browser completes, would
+// lose its session at the login form.
+type secureContextJar struct{ http.CookieJar }
+
+func (j secureContextJar) SetCookies(u *url.URL, cookies []*http.Cookie) {
+	j.CookieJar.SetCookies(secureContext(u), cookies)
+}
+
+func (j secureContextJar) Cookies(u *url.URL) []*http.Cookie {
+	return j.CookieJar.Cookies(secureContext(u))
+}
+
+// secureContext is u as a browser regards it: a loopback name over http is a
+// secure context, so it reads as https to the jar. Any other URL is itself.
+func secureContext(u *url.URL) *url.URL {
+	if u.Scheme != "http" || !loopbackName(u.Hostname()) {
+		return u
+	}
+	c := *u
+	c.Scheme = "https"
+	return &c
+}
+
+// loopbackName says whether a browser treats host as this machine: localhost,
+// a name under .localhost, or a loopback address.
+func loopbackName(host string) bool {
+	h := strings.TrimSuffix(strings.ToLower(host), ".")
+	if h == "localhost" || strings.HasSuffix(h, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
 }
 
 // landing is where a request ended up: a page, or the redirect back to the web
@@ -553,8 +593,14 @@ func loginRefused(got *landing) Result {
 	if p.title != "" {
 		title = " “" + p.title + "”"
 	}
+	fix := "a lost login session reads like this (cookies dropped by a proxy, or identity provider replicas that do not share sessions) — so does a disabled account"
+	if got.at != nil && got.at.Scheme == "http" && !loopbackName(got.at.Hostname()) &&
+		strings.Contains(strings.ToLower(p.message+" "+p.title), "cookie") {
+		fix = "serve the instance over https: the identity provider marks its login cookies Secure, and a browser sends those only over https or to a localhost name — over plain http on " +
+			got.at.Hostname() + " nobody can sign in"
+	}
 	return Result{Name: name, Status: Fail, Detail: fmt.Sprintf("the identity provider answered HTTP %d, a page%s with no way forward%s", got.status, title, said),
-		Fix: "a lost login session reads like this (cookies dropped by a proxy, or identity provider replicas that do not share sessions) — so does a disabled account"}
+		Fix: fix}
 }
 
 // wrongPassword recognises the identity provider saying the credentials are

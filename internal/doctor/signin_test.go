@@ -3,6 +3,7 @@ package doctor
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -406,5 +407,96 @@ func TestALoginFormThatWouldPutThePasswordInAnAddress(t *testing.T) {
 	}
 	if w.called("GET "+realmPath+"/login-actions") != 0 || w.called("POST "+realmPath+"/login-actions") != 0 {
 		t.Fatalf("the form was sent: %v", w.requests)
+	}
+}
+
+// A browser counts localhost names and loopback addresses as secure contexts
+// and sends them Keycloak's Secure login cookies over plain http; any other
+// host gets them over https only.
+func TestLoopbackNamesAreSecureContexts(t *testing.T) {
+	for host, want := range map[string]bool{
+		"localhost": true, "LOCALHOST.": true, "zaentrum.localhost": true, "a.b.localhost": true,
+		"127.0.0.1": true, "127.8.9.10": true, "::1": true,
+		"example.org": false, "media.lan": false, "localhost.example.org": false, "notlocalhost": false,
+		"10.0.0.1": false, "192.168.1.10": false,
+	} {
+		if got := loopbackName(host); got != want {
+			t.Errorf("loopbackName(%q) = %v, want %v", host, got, want)
+		}
+	}
+	for raw, want := range map[string]string{
+		"http://zaentrum.localhost/auth": "https",
+		"http://127.0.0.1:8080/":         "https",
+		"http://media.lan/auth":          "http",
+		"https://media.example.org/":     "https",
+	} {
+		u, _ := url.Parse(raw)
+		if got := secureContext(u).Scheme; got != want {
+			t.Errorf("secureContext(%s) scheme = %s, want %s", raw, got, want)
+		}
+		if u.Scheme != strings.SplitN(raw, ":", 2)[0] {
+			t.Errorf("secureContext changed its argument %s", raw)
+		}
+	}
+}
+
+// Over plain http on a name that is not localhost, the lost login cookie is no
+// proxy's fault: a browser would drop it as well, so the fix says https.
+func TestLostCookieOverPlainHTTPSaysHTTPS(t *testing.T) {
+	page := &page{title: "Sign in to chino", message: "Cookie not found. Please make sure cookies are enabled in your browser."}
+	at, _ := url.Parse("http://media.lan/auth/realms/zaentrum/login-actions/authenticate")
+	r := loginRefused(&landing{status: 400, at: at, page: page})
+	if r.Status != Fail || !strings.Contains(r.Fix, "serve the instance over https") || !strings.Contains(r.Fix, "media.lan") {
+		t.Fatalf("plain http on a LAN name: %+v", r)
+	}
+	at, _ = url.Parse("https://media.example.org/auth/realms/zaentrum/login-actions/authenticate")
+	if r := loginRefused(&landing{status: 400, at: at, page: page}); strings.Contains(r.Fix, "over https") {
+		t.Fatalf("https: the cookie went missing for another reason, not for the scheme: %+v", r)
+	}
+	at, _ = url.Parse("http://zaentrum.localhost/auth/realms/zaentrum/login-actions/authenticate")
+	if r := loginRefused(&landing{status: 400, at: at, page: page}); strings.Contains(r.Fix, "over https") {
+		t.Fatalf("a localhost name keeps its Secure cookies over http: %+v", r)
+	}
+}
+
+// recordingJar remembers the URL each call asked with.
+type recordingJar struct{ asked []string }
+
+func (j *recordingJar) SetCookies(u *url.URL, _ []*http.Cookie) {
+	j.asked = append(j.asked, "set "+u.String())
+}
+func (j *recordingJar) Cookies(u *url.URL) []*http.Cookie {
+	j.asked = append(j.asked, "get "+u.String())
+	return nil
+}
+
+// The wrapper hands the jar a localhost name over http as https, so a Secure
+// cookie travels there whatever jar is underneath — Go's own treats localhost
+// as secure only since Go 1.26, and the image builds with an older one.
+func TestSecureContextJarHandsLocalhostOverAsHTTPS(t *testing.T) {
+	inner := &recordingJar{}
+	jar := secureContextJar{inner}
+	for _, raw := range []string{"http://zaentrum.localhost/auth/x", "http://media.lan/auth/x", "https://media.example.org/x"} {
+		u, _ := url.Parse(raw)
+		jar.SetCookies(u, nil)
+		jar.Cookies(u)
+	}
+	want := []string{
+		"set https://zaentrum.localhost/auth/x", "get https://zaentrum.localhost/auth/x",
+		"set http://media.lan/auth/x", "get http://media.lan/auth/x",
+		"set https://media.example.org/x", "get https://media.example.org/x",
+	}
+	if strings.Join(inner.asked, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("the jar was asked with\n%s\nwant\n%s", strings.Join(inner.asked, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+// The sign-in's browser keeps its cookies in the secure-context jar: with Go's
+// jar alone, an image built before Go 1.26 loses a localhost sign-in's session.
+func TestSignInBrowserUsesTheSecureContextJar(t *testing.T) {
+	idp, _ := url.Parse("http://zaentrum.localhost/auth/realms/zaentrum")
+	b := newBrowser(idp, nil, "zae-test")
+	if _, ok := b.http.Jar.(secureContextJar); !ok {
+		t.Fatalf("the sign-in keeps cookies in a %T", b.http.Jar)
 	}
 }
