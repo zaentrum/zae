@@ -71,6 +71,87 @@ The binary splits in two, and the split is the point:
 `zae <service> <command> --url …` runs one (`--arg name=value` fills path
 placeholders, `--query k=v` adds parameters, `--data '{…}'` sends a body).
 
+## The platform checking itself — `zae doctor --sign-in`
+
+The static checks stop at the front door. `--sign-in` goes one step further
+in, and no further than a person does: it signs in through the instance's own
+login page, as its web client does, and uses the platform with that token —
+reading only.
+
+```
+$ ZAE_DOCTOR_USER=… ZAE_DOCTOR_PASSWORD=… zae doctor --url https://media.example.org --sign-in
+  …the static checks…
+
+  ✓ sign-in                      with a password through the login page, as a person does (ZAE_DOCTOR_USER, ZAE_DOCTOR_PASSWORD)
+  ✓ chino-api: config            the issuer https://media.example.org/auth/realms/zaentrum and the web client "chino-web"
+  ✓ sign-in: issuer              the login page is at https://media.example.org/auth/realms/zaentrum/protocol/openid-connect/auth
+  ✓ sign-in: authorization       the login page answers for "chino-web", its form posting to /login-actions/authenticate
+  ✓ sign-in: login form          the account signed in, and the identity provider redirected back to the web client
+  ✓ sign-in: callback            back at https://media.example.org/auth/callback with a code, and the state is this request's
+  ✓ sign-in: token exchange      the code was exchanged for an access token, an ID token and a refresh token
+  ✓ sign-in: id token            issued by https://media.example.org/auth/realms/zaentrum for "chino-web", answering this sign-in, valid until 10:10 UTC
+  ✓ sign-in: access token        issued by the issuer the instance advertises, for "chino" as chino-api requires
+  ✓ portal: launchpad            4 tiles open apps at /chino/, /katalog/, /katalog-manage/
+  ✓ app /portal/                 serves its page and /portal/assets/index-BGvfzfuV.js (application/javascript)
+  ✓ app /chino/                  serves its page and /chino/assets/index-HxjBeITW.js (application/javascript)
+  …
+  ✓ chino-api: item detail       "Sintel" opens with 9 credits, each with a person, a name and a role
+  ✓ chino-api: portrait          "Thom Hoffman": image/jpeg, 49 KB
+  - chino-api: playback          no packaged title to play
+  ✓ katalog-manager: graphql     answers GraphQL at /api/manage/query
+
+doctor: no failures
+```
+
+This is the check a platform runs on **itself** after every update: the
+operator runs the `ghcr.io/zaentrum/zae` image as a Job in the platform's own
+namespace, signed in as a test account it created — so no password leaves the
+cluster — and records the outcome on its resource. `zae platform status`
+shows the last one, and `zae platform verify` asks for one now.
+
+- **Credentials** come from `ZAE_DOCTOR_USER` and `ZAE_DOCTOR_PASSWORD`, never
+  from flags (a flag is visible in the process list and kept in shell
+  history), and neither is ever printed. Without them doctor uses the bearer
+  every command sends — `ZAE_TOKEN`, else the session `zae login` stored for
+  the instance — and without that the signed-in checks are one skip line that
+  says how to run them. A stored session belongs to the CLI's own client,
+  whose tokens chino-api may not accept: that is a skip, not a failure.
+- **Signing in the way a person does.** The issuer and the web client's id
+  come from the instance's `/api/config`; the authorization request carries
+  PKCE S256, a state and a nonce; the login form is found by where it posts,
+  not by how the login theme draws it; the redirect back to
+  `<instance>/auth/callback` is where it stops; the code is exchanged, and the
+  ID token's issuer, audience and nonce are checked. Each step is its own line
+  with a fix that names the likely cause — the issuer trap, a redirect URI the
+  client does not allow, a wrong password, a required action pending
+  (`UPDATE_PASSWORD`, `VERIFY_PROFILE`, …), a second factor. The password is
+  posted once, and only to the identity provider's own origin.
+- **Then the platform, with the token.** The launchpad says where the apps
+  are mounted, and each must serve its page *and* the bundle the page loads —
+  a missing bundle behind a single-page fallback is a blank screen that a
+  status code calls healthy. chino-api: a list, a title with well-formed
+  credits, its poster, a person found by a credit's name, their page and
+  portrait, the master playlist of a packaged title. The catalog console's
+  GraphQL, where a refusal in the service's own words counts as reachable.
+- **Data-independent, read-only, bounded.** An empty instance passes: a check
+  that needs a title, a person or a package the instance does not have is a
+  skip. Every request is a read — GETs, the sign-in's two posts, one GraphQL
+  query — each under doctor's short timeout, and the token is sent only to the
+  instance's own origin.
+- **`--report FILE`** writes the run as one line of JSON of at most 4096
+  bytes, which is what Kubernetes keeps of `/dev/termination-log`:
+
+  ```json
+  {"v":1,"zae":"v0.6.0","url":"https://media.example.org","passed":26,"failed":1,"warned":0,"skipped":0,
+   "checks":[{"n":"tls","s":"ok","d":"certificate valid, 89 days left"},
+             {"n":"chino-api: items","s":"fail","d":"/api/v1/items?limit=5 answered HTTP 502: … · fix: …"}]}
+  ```
+
+  When a run does not fit, the least useful text goes first — the details of
+  passing checks, then of skips and warnings — and a failure is never
+  dropped; the counts are always the run's own. The exit code stays doctor's:
+  `1` on any failure.
+
 ## Addons from a chart — `zae addon`
 
 An addon is a standard Helm chart; the platform's operator installs it from one
@@ -168,6 +249,7 @@ https://media.example.org — the platform
   phase        Ready
   running      1.4.0
   update       1.5.0 available — apply it with: zae platform update --apply --url https://media.example.org
+  verified     passed 21/22, 1 skipped · 3 min ago · after the update to 1.4.0 (image set 3f9a1c0b2d4e)
   host         media.example.org
 
 NAME            GROUP          IMAGE                READY  PHASE     REASON
@@ -204,6 +286,23 @@ the platform reports 1.5.0, and every workload the operator manages is ready
 | `zae platform update --url …` | `--version V` pins an image tag (`--version latest` follows the channel again), `--channel C` picks the release train, `--mode auto\|manual` decides whether the operator updates itself, `--apply` pins the update it has already discovered |
 | `zae platform restart <workload> --url …` | rolls one workload |
 | `zae platform scale <workload> <replicas> --url …` | sets one workload's replica count |
+| `zae platform verify --url …` | asks the operator to verify the platform now; `--wait` follows the run this request started and prints its checks |
+
+- **The platform verifies itself.** After every rollout the operator runs
+  `zae doctor --sign-in` in the platform's namespace as a test account it
+  created, and records the result; `status` shows it on the `verified` line —
+  `passed 14/14 · 3 min ago · after the update to 1.5.0 (image set …)`, or
+  `FAILED 2 of 14 checks` with each failing check under it, `running`,
+  `error` with the operator's message, `skipped`, `never`, or `off` when
+  `spec.verification.enabled` is false. The image set is the fingerprint of the
+  images verified, so a run after an update to `latest` still names what it
+  checked.
+- **`verify` asks, and follows its own run.** A request that is already
+  waiting is joined, not doubled. `--wait` ends on the result of the run that
+  answers *this* request — a run for an earlier one may finish first and does
+  not count — and exits `0` when it passed, `1` when it failed or could not
+  run, and `3` when the platform does not verify itself (switched off, no
+  operator, or a portal-api that predates the request).
 
 - **The controller is shown, never updated.** It runs in its own namespace,
   outside the one the portal administers, and it is installed and upgraded
@@ -368,6 +467,8 @@ still wins, for service accounts and CI.
 | | |
 |---|---|
 | `zae doctor` (outside-in static checks) | ✅ works today |
+| `zae doctor --sign-in` / `--report` (the check a platform runs on itself) | ✅ works — run against a live instance, password sign-in through its login page |
+| `zae platform verify`, and the `verified` line of `status` | 🔶 built against portal-api's verification API; needs an operator that verifies the platform |
 | `zae discover` | ✅ works — and reports honestly when an instance has no discovery endpoint yet |
 | Instance-side capability discovery (`/api/portal/cli/discovery`) | ✅ served by portal-api; acquire is the first service declaring itself (10 commands) |
 | Running discovered commands, with the exit-code contract and `zae require` | ✅ v0.2 |

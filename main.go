@@ -3,8 +3,10 @@
 // The design splits the binary in two, and the split is the point:
 //
 //   - a STATIC core — the commands that must work when the platform cannot
-//     speak for itself: preflight and outside-in diagnosis (doctor), signing
-//     in (login), adding addons from a chart (addon). These ship in the binary
+//     speak for itself: preflight and outside-in diagnosis (doctor, which
+//     with --sign-in also uses the platform the way a person does — the check
+//     the platform runs on itself after every update), signing in (login),
+//     adding addons from a chart (addon). These ship in the binary
 //     because a service can only extend the CLI once it is running, and the
 //     moments you need doctor most are the moments nothing is. An addon
 //     cannot declare the command that installs it.
@@ -44,6 +46,9 @@ Usage:
   zae logout --url https://… | --all               forget a stored session
   zae whoami --url https://…                       who zae's bearer says you are
   zae doctor --url https://your-instance.example   outside-in health of an instance
+  zae doctor --url https://… --sign-in [--report FILE]
+                                                   …then signed in as a person, read-only
+                                                   (ZAE_DOCTOR_USER/ZAE_DOCTOR_PASSWORD, else your login)
   zae discover --url https://…                     show the instance's capability surface
   zae require <service>[.<command>] --url https://… assert the instance offers it (exit 0/3/4/6, silent)
   zae addon add <chart> --url https://… [flags]    plan an addon from a Helm chart, confirm, install
@@ -51,6 +56,7 @@ Usage:
   zae platform status --url https://…              the platform's version, update and workloads
   zae platform controller --url https://…          the operator's own controller, and what updates it
   zae platform update|restart|scale …              drive platform updates ('zae platform help')
+  zae platform verify --url https://… [--wait]     ask the platform to verify itself now
   zae <service> <command> --url https://… [--arg k=v] [--query k=v] [--data JSON]
   zae version
 
