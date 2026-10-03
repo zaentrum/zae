@@ -1,10 +1,12 @@
 // Package addon is `zae addon`: adding, inspecting, upgrading and removing
-// addons the platform installs from a Helm chart (ADR-0011).
+// addons the platform installs from a Helm chart (ADR-0011) — and the addons
+// deployed some other way and added by their in-cluster address, which the
+// portal registers from the manifest they serve (address.go).
 //
 // Unlike `zae <service> <command>`, these are STATIC commands. They drive the
-// portal's admin API for chart addons, which an instance has whether or not
-// any addon is installed — and nothing here knows any addon: an addon is a
-// chart reference and a name.
+// portal's admin API for addons, which an instance has whether or not any
+// addon is installed — and nothing here knows any addon: an addon is a chart
+// reference or an address, and a name.
 //
 // Plan first, always. add and upgrade leave the addon suspended — the
 // operator plans it and applies nothing — wait for the plan the operator made
@@ -50,7 +52,7 @@ var (
 const defaultTimeout = 5 * time.Minute
 
 func usage(w io.Writer) {
-	fmt.Fprint(w, `zae addon — addons the platform installs from a Helm chart
+	fmt.Fprint(w, `zae addon — addons the platform installs from a Helm chart, or adds by their address
 
 Usage:
   zae addon add <chart> --url https://… [--name N] [--version V] [--digest sha256:…]
@@ -69,6 +71,10 @@ link to a chart archive; pin the archive with --digest. add and upgrade show
 the operator's plan — chart, workloads, images, ports, refusals, missing
 inputs — and ask before installing. --yes skips the question; without a
 terminal on stdin it is required.
+
+list, status and remove also know the addons deployed some other way and
+added by their in-cluster address: the portal registers what their manifest
+declares, and neither deploys nor deletes their containers.
 
 Values: --values is one JSON object (a file, or - for stdin); --set path=value
 sets one value, JSON when it parses as JSON and a string otherwise
@@ -475,8 +481,11 @@ func list(args []string) int {
 	return exitcode.OK
 }
 
-// status prints one chart addon: phase, what it asks for, what runs,
-// components, registration and plan.
+// status prints one addon. A chart addon: phase, what it asks for, what runs,
+// components, registration and plan. An addon the chart API has no record of
+// is looked for in the addons list — one added by its address: where it was
+// added from, the version it reports, whether a refresh waits, its containers
+// and its setup.
 func status(args []string) int {
 	fs := flagSet("status")
 	rawURL := fs.String("url", "", "public URL of the instance (required)")
@@ -493,31 +502,40 @@ func status(args []string) int {
 		return usageErr("%v", err)
 	}
 	name := pos[0]
-	if !validName(name) {
+	if !validKey(name) {
 		return usageErr("%q is not a valid addon name", name)
 	}
 	c := newClient(base)
 	ctx := context.Background()
 	if *asJSON {
 		var raw json.RawMessage
-		if err := c.do(ctx, "status of "+name, http.MethodGet, namePath(name), nil, &raw,
-			fmt.Sprintf("%s has no addon %q installed from a chart", base, name)); err != nil {
-			return fail(err)
+		err := c.do(ctx, "status of "+name, http.MethodGet, namePath(name), nil, &raw,
+			fmt.Sprintf("%s has no addon %q installed from a chart", base, name))
+		switch {
+		case err == nil:
+			fmt.Fprintln(stdout, strings.TrimSpace(string(raw)))
+			return exitcode.OK
+		case fallsBack(err):
+			return statusByAddress(ctx, c, base, name, true)
 		}
-		fmt.Fprintln(stdout, strings.TrimSpace(string(raw)))
-		return exitcode.OK
+		return fail(err)
 	}
 	a, gerr := c.get(ctx, name)
-	if gerr != nil {
-		return fail(gerr)
+	switch {
+	case gerr == nil:
+		renderStatus(stdout, a)
+		return exitcode.OK
+	case fallsBack(gerr):
+		return statusByAddress(ctx, c, base, name, false)
 	}
-	renderStatus(stdout, a)
-	return exitcode.OK
+	return fail(gerr)
 }
 
 // remove deletes a chart addon. The operator's objects go with the resource
 // by garbage collection. The addon's values Secret and the Secret with its
-// generated values go too — or, with --keep-values, both stay.
+// generated values go too — or, with --keep-values, both stay. An addon added
+// by its address loses what the portal created for it; its containers are not
+// the platform's to delete.
 func remove(args []string) int {
 	s := newSession()
 	defer s.close()
@@ -538,7 +556,7 @@ func remove(args []string) int {
 		return usageErr("%v", err)
 	}
 	name := pos[0]
-	if !validName(name) {
+	if !validKey(name) {
 		return usageErr("%q is not a valid addon name", name)
 	}
 	if !*yes && !canAsk() {
@@ -547,7 +565,25 @@ func remove(args []string) int {
 	c := newClient(base)
 	a, gerr := c.get(s.ctx, name)
 	if gerr != nil {
-		return failOr(s, gerr, "")
+		if s.interrupted() || !fallsBack(gerr) {
+			return failOr(s, gerr, "")
+		}
+		row, _, lerr := findListed(s.ctx, c, name)
+		switch {
+		case lerr != nil:
+			return failOr(s, lerr, "")
+		case row == nil:
+			errf("not offered: %s has no addon %q — zae addon list --url %s lists what it has", base, name, base)
+			return exitcode.NotOffered
+		case row.Chart != nil:
+			// Registered from a chart whose resource zae cannot read: the
+			// portal refuses to remove its rows alone, since its registration
+			// would put them back.
+			return fail(gerr)
+		case *keep:
+			return usageErr("--keep-values keeps a chart addon's values Secrets; %s was added by its address and has none", name)
+		}
+		return removeAddress(s, c, base, row, *yes)
 	}
 	fmt.Fprintf(stdout, "%s — %s\n", name, describe(a))
 	if len(a.Components) > 0 {

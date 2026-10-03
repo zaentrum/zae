@@ -785,7 +785,7 @@ func TestList(t *testing.T) {
 	   "components":[{"name":"example","ready":1,"desired":1},{"name":"example-worker","ready":0,"desired":1}]},
 	  {"key":"fresh","chart":{"ref":"https://example.org/charts/fresh-0.1.0.tgz","version":"","lastApplied":null},
 	   "phase":"Ready","registered":false,"components":[]},
-	  {"key":"other","proxyUrl":"http://other","version":"0.4.0","registered":true,
+	  {"key":"other","proxyUrl":"http://other","version":"0.4.0","registered":true,"refreshAvailable":true,
 	   "components":[{"name":"other","ready":null,"desired":null}]}
 	]`
 	code, out, errs := run(t, "", false, "list", "--url", srv.URL)
@@ -793,10 +793,13 @@ func TestList(t *testing.T) {
 		t.Fatalf("want 0, got %d %q", code, errs)
 	}
 	for _, re := range []string{
-		`NAME\s+SOURCE\s+VERSION\s+PHASE\s+READY`,
-		`example\s+oci://ghcr.io/example/charts/example\s+1\.3\.0 \(runs 1\.2\.0\)\s+Planned \(suspended\)\s+1/2`,
-		`fresh\s+https://example.org/charts/fresh-0\.1\.0\.tgz\s+- \(not running\)\s+Ready, not registered\s+-`,
-		`other\s+http://other\s+0\.4\.0\s+installed\s+0/1`,
+		`NAME\s+SOURCE\s+VERSION\s+CHART\s+PHASE\s+READY\s+REFRESH`,
+		// VERSION is what the addon reports; CHART what its resource asks for,
+		// and what runs when that differs.
+		`example\s+oci://ghcr.io/example/charts/example\s+4\.1\.0\s+1\.3\.0 \(runs 1\.2\.0\)\s+Planned \(suspended\)\s+1/2\s+-$`,
+		`fresh\s+https://example.org/charts/fresh-0\.1\.0\.tgz\s+-\s+- \(not running\)\s+Ready, not registered\s+-\s+-$`,
+		// Only an addon added by its address is refreshed by hand.
+		`other\s+http://other\s+0\.4\.0\s+-\s+installed\s+0/1\s+available$`,
 	} {
 		if !regexpLine(out, re) {
 			t.Errorf("list lacks a line matching %s:\n%s", re, out)

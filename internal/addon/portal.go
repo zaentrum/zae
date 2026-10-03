@@ -182,18 +182,38 @@ type removal struct {
 }
 
 // Listed is one row of GET /api/portal/addons: every installed addon, with
-// chart information merged in for chart addons.
+// chart information merged in for chart addons. It is the only read there is
+// of an addon added by its address.
 type Listed struct {
-	Key               string          `json:"key"`
-	Name              string          `json:"name"`
-	ProxyURL          string          `json:"proxyUrl"`
-	Version           string          `json:"version"`
-	Chart             *listChart      `json:"chart"`
-	Phase             string          `json:"phase"`
-	Suspended         bool            `json:"suspended"`
-	Registered        bool            `json:"registered"`
-	RegistrationError string          `json:"registrationError"`
-	Components        []listComponent `json:"components"`
+	Key      string `json:"key"`
+	Name     string `json:"name"`
+	Title    string `json:"title"`
+	ProxyURL string `json:"proxyUrl"`
+	// Version is what the addon's own manifest says it is.
+	Version     string          `json:"version"`
+	InstalledAt time.Time       `json:"installedAt"`
+	RefreshedAt time.Time       `json:"refreshedAt"`
+	Tiles       int             `json:"tiles"`
+	Slots       int             `json:"slots"`
+	Setup       *setupDecl      `json:"setup"`
+	Chart       *listChart      `json:"chart"`
+	Phase       string          `json:"phase"`
+	Suspended   bool            `json:"suspended"`
+	Registered  bool            `json:"registered"`
+	Components  []listComponent `json:"components"`
+	// RefreshAvailable: the addon now serves another manifest than the one
+	// installed. Only an address addon is refreshed by hand; the portal
+	// registers a chart addon again by itself, and says false for it.
+	RefreshAvailable  bool   `json:"refreshAvailable"`
+	RegistrationError string `json:"registrationError"`
+}
+
+// key is the addon's name: its key, or the name an older portal sent.
+func (r *Listed) key() string {
+	if r.Key != "" {
+		return r.Key
+	}
+	return r.Name
 }
 
 // listChart is a list row's chart: what the resource asks for, and what runs.
@@ -204,12 +224,19 @@ type listChart struct {
 	LastApplied *Chart `json:"lastApplied"`
 }
 
-// listComponent tolerates both shapes the list carries: pointers that are null
-// for a workload that is not deployed, and plain numbers.
+// listComponent is one container an addon declares, with its workload's live
+// state. The state is null for a workload that is not deployed, and the phase
+// "unknown" when the portal cannot see workloads; plain numbers are read too.
 type listComponent struct {
-	Name    string `json:"name"`
-	Ready   *int   `json:"ready"`
-	Desired *int   `json:"desired"`
+	Name     string  `json:"name"`
+	Workload string  `json:"workload"`
+	Role     string  `json:"role"`
+	Summary  string  `json:"summary"`
+	Phase    *string `json:"phase"`
+	Ready    *int    `json:"ready"`
+	Desired  *int    `json:"desired"`
+	Restarts *int    `json:"restarts"`
+	Reason   *string `json:"reason"`
 }
 
 // apiError is a call that did not succeed, already mapped onto the exit-code
@@ -306,8 +333,14 @@ func (c *client) do(ctx context.Context, what, method, path string, in, out any,
 			missing = fmt.Sprintf("%s: %s answered 404: %s", what, c.base, excerpt(raw))
 		}
 		return &apiError{code: exitcode.NotOffered, status: s, notFound: true, msg: "not offered: " + missing}
-	case s == http.StatusServiceUnavailable:
+	case s == http.StatusServiceUnavailable && strings.HasPrefix(path, chartsPath):
 		return c.unavailable(ctx, what, raw)
+	case s == http.StatusServiceUnavailable:
+		// Outside the chart API a 503 says nothing about charts: the
+		// address-addon routes answer it while the cluster cannot list its
+		// workloads for a moment, which passes.
+		return &apiError{code: exitcode.Undetermined, status: s, transient: true,
+			msg: fmt.Sprintf("undetermined: %s: %s answered 503: %s", what, c.base, excerpt(raw))}
 	case s >= 300 && s < 400:
 		return &apiError{code: exitcode.Failed, status: s,
 			msg: fmt.Sprintf("failed: %s: %s answered %d, redirecting to %s — use the instance's final address as --url; a sign-in page means the bearer in %s is missing", what, c.base, s, resp.Header.Get("Location"), instance.TokenEnv)}
@@ -414,5 +447,6 @@ func excerpt(b []byte) string {
 	if s == "" {
 		return "(empty body)"
 	}
-	return s
+	// An address addon's refusal can quote what the addon itself served.
+	return printable(s)
 }

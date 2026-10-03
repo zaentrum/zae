@@ -280,33 +280,36 @@ func renderStatus(w io.Writer, a *Addon) {
 	}
 }
 
-// renderList prints every installed addon. Chart addons show their chart, the
-// version asked for next to the one running, and their phase; addons installed
-// from an address show the address and the manifest's version.
+// renderList prints every installed addon: where it comes from — its chart, or
+// the address it was added by — the version the addon itself reports, a chart
+// addon's chart version (asked for, and running when that differs), its
+// phase, its ready containers, and whether a refresh waits.
+//
+// Only an addon added by its address is refreshed by hand: the portal
+// registers a chart addon again by itself whenever its manifest changes.
 func renderList(w io.Writer, rows []Listed) {
 	if len(rows) == 0 {
 		fmt.Fprintln(w, "no addons installed")
 		return
 	}
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "NAME\tSOURCE\tVERSION\tPHASE\tREADY")
+	fmt.Fprintln(tw, "NAME\tSOURCE\tVERSION\tCHART\tPHASE\tREADY\tREFRESH")
 	for _, r := range rows {
-		name := r.Key
-		if name == "" {
-			name = r.Name
-		}
-		source, version, phase := r.ProxyURL, dash(r.Version), "installed"
+		source, chart, phase, refresh := r.ProxyURL, "-", "installed", "-"
 		if r.Chart != nil && r.Chart.Ref != "" {
 			source, phase = r.Chart.Ref, phaseOr(r.Phase)
-			version = listVersion(r.Chart)
+			chart = listVersion(r.Chart)
 			if !r.Registered && r.Phase == PhaseReady {
 				phase += ", not registered"
 			}
+		} else if r.RefreshAvailable {
+			refresh = "available"
 		}
 		if r.Suspended {
 			phase += " (suspended)"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", name, dash(source), version, phase, readyCount(r.Components))
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", printable(r.key()), dash(source), dash(printable(r.Version)),
+			chart, phase, readyCount(r.Components), refresh)
 	}
 	tw.Flush()
 }
