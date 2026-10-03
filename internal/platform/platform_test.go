@@ -55,6 +55,12 @@ type fakePortal struct {
 	// written — `{"enabled":true,"result":null}` is not what encoding a
 	// Verification produces.
 	verificationRaw string
+	// verifyStatus and verifyBody answer POST …/verify instead of the
+	// portal's 202, for the refusals.
+	verifyStatus int
+	verifyBody   string
+	verifies     int
+	onVerify     func(p *fakePortal, token string)
 }
 
 func newPortal(t *testing.T) (*fakePortal, *httptest.Server) {
@@ -73,6 +79,7 @@ func newPortal(t *testing.T) (*fakePortal, *httptest.Server) {
 	mux.HandleFunc("POST "+applyPath, p.applyUpdate)
 	mux.HandleFunc("POST "+operatorPath+"/instances/{name}/scale", p.scale)
 	mux.HandleFunc("POST "+operatorPath+"/instances/{name}/restart", p.restart)
+	mux.HandleFunc("POST "+verifyPath, p.verify)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		p.mu.Lock()
@@ -294,6 +301,31 @@ func (p *fakePortal) restart(w http.ResponseWriter, r *http.Request) {
 		p.wrote()
 		p.answer(w, write{Name: wl.Name, Generation: wl.Generation, RestartedAt: wl.RestartedAt})
 	}
+}
+
+// verify is the portal's POST …/verify: a fresh request token on the
+// resource — or, when one is already waiting, that one, so two askers start
+// one run.
+func (p *fakePortal) verify(w http.ResponseWriter, r *http.Request) {
+	p.verifies++
+	if p.verifyStatus != 0 {
+		http.Error(w, p.verifyBody, p.verifyStatus)
+		return
+	}
+	if p.op.Verification == nil {
+		p.op.Verification = &Verification{Enabled: ptr(true)}
+	}
+	token := p.op.Verification.PendingRequest
+	if token == "" {
+		token = fmt.Sprintf("req-%d", p.verifies)
+		p.op.Verification.PendingRequest = token
+	}
+	if p.onVerify != nil {
+		p.onVerify(p, token)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(map[string]string{"request": token})
 }
 
 func ptr[T any](v T) *T { return &v }

@@ -21,6 +21,7 @@ import (
 const (
 	operatorPath = "/api/portal/operator"
 	applyPath    = operatorPath + "/apply-update"
+	verifyPath   = operatorPath + "/verify"
 )
 
 // instancePath addresses one workload's action. The name is escaped because
@@ -421,6 +422,8 @@ type apiError struct {
 	code   int
 	msg    string
 	status int // the HTTP status, 0 when there was no answer
+	// said is the portal's own words, for a caller that words its own message.
+	said string
 	// transient: no answer, or the portal failing for a moment — worth asking
 	// again while waiting, never a verdict about the platform.
 	transient bool
@@ -488,44 +491,44 @@ func (c *client) do(ctx context.Context, what, method, path string, in, out any)
 	case s >= 200 && s < 300:
 		if out != nil && len(bytes.TrimSpace(raw)) > 0 {
 			if err := json.Unmarshal(raw, out); err != nil {
-				return &apiError{code: exitcode.Undetermined, status: s,
+				return &apiError{said: excerpt(raw), code: exitcode.Undetermined, status: s,
 					msg: fmt.Sprintf("undetermined: %s: %s answered %d with something that is not the operator console's JSON (%v) — does the address reach portal-api?", what, c.base, s, err)}
 			}
 		}
 		return nil
 	case s == http.StatusUnauthorized || s == http.StatusForbidden:
-		return &apiError{code: exitcode.Forbidden, status: s,
+		return &apiError{said: excerpt(raw), code: exitcode.Forbidden, status: s,
 			msg: fmt.Sprintf("forbidden: %s: %s answered %d — %s", what, c.base, s, instance.ForbiddenHint(c.base, adminNeed))}
 	case s == http.StatusNotFound:
 		// A router's own 404 means the route is absent: a portal-api that
 		// predates the operator console. Anything else is the API's own answer.
 		if strings.TrimSpace(string(raw)) == "404 page not found" {
-			return &apiError{code: exitcode.NotOffered, status: s,
+			return &apiError{said: excerpt(raw), code: exitcode.NotOffered, status: s,
 				msg: fmt.Sprintf("not offered: %s does not serve %s — its portal-api predates the operator console", c.base, operatorPath)}
 		}
-		return &apiError{code: exitcode.NotOffered, status: s,
+		return &apiError{said: excerpt(raw), code: exitcode.NotOffered, status: s,
 			msg: fmt.Sprintf("not offered: %s: %s answered 404: %s", what, c.base, excerpt(raw))}
 	case s == http.StatusConflict:
 		// The platform refused because what zae asked for is no longer what it
 		// read: the update on the shelf changed while the question was being
 		// answered. Looking again is the whole fix, so say that.
-		return &apiError{code: exitcode.Failed, status: s,
+		return &apiError{said: excerpt(raw), code: exitcode.Failed, status: s,
 			msg: fmt.Sprintf("failed: %s: %s — look again with: zae platform status --url %s", what, excerpt(raw), c.base)}
 	case s == http.StatusServiceUnavailable:
 		// The portal says this in exactly one case: it is not running where it
 		// could manage anything. That is definitive, and no wait changes it.
 		// Any other 503 is somebody's gateway, which says nothing either way.
 		if strings.HasPrefix(strings.TrimSpace(string(raw)), noManagement) {
-			return &apiError{code: exitcode.NotOffered, status: s,
+			return &apiError{said: excerpt(raw), code: exitcode.NotOffered, status: s,
 				msg: fmt.Sprintf("not offered: %s does not manage its own workloads: %s", c.base, excerpt(raw))}
 		}
-		return &apiError{code: exitcode.Undetermined, status: s, transient: true,
+		return &apiError{said: excerpt(raw), code: exitcode.Undetermined, status: s, transient: true,
 			msg: fmt.Sprintf("undetermined: %s: %s answered 503: %s", what, c.base, excerpt(raw))}
 	case s >= 300 && s < 400:
-		return &apiError{code: exitcode.Failed, status: s,
+		return &apiError{said: excerpt(raw), code: exitcode.Failed, status: s,
 			msg: fmt.Sprintf("failed: %s: %s answered %d, redirecting to %s — use the instance's final address as --url; a sign-in page means the bearer in %s is missing", what, c.base, s, resp.Header.Get("Location"), instance.TokenEnv)}
 	default:
-		return &apiError{code: exitcode.Failed, status: s, transient: s >= 500,
+		return &apiError{said: excerpt(raw), code: exitcode.Failed, status: s, transient: s >= 500,
 			msg: fmt.Sprintf("failed: %s: HTTP %d from %s: %s", what, s, c.base, excerpt(raw))}
 	}
 }

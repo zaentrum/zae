@@ -63,6 +63,7 @@ Usage:
       [--apply] [--yes] [--wait] [--timeout 10m]
   zae platform restart <workload> --url https://… [--yes] [--wait] [--timeout 10m]
   zae platform scale <workload> <replicas> --url https://… [--yes] [--wait] [--timeout 10m]
+  zae platform verify --url https://… [--yes] [--wait] [--timeout 10m]
 
 status shows the version the platform is pinned to — or that nothing is
 pinned and it follows a channel — the channel, the update mode, the phase, the
@@ -90,6 +91,13 @@ every workload the operator manages is ready.
 restart and scale act on one workload. The platform protects its stateful
 services and refuses those itself, in its own words.
 
+verify asks the operator to verify the platform now — the check it makes by
+itself after every rollout: zae doctor --sign-in, run in the platform's own
+namespace as a test account the operator created, so no password leaves the
+cluster. status shows the last one on its "verified" line. --wait follows the
+run this request started and prints its checks: exit 0 when it passed, 1 when
+it failed or could not run, 3 when the platform does not verify itself.
+
 --wait follows the rollout THIS command produced, by the rule kubectl rollout
 status uses: the cluster has acted on the generation the write returned, every
 pod asked for comes from the new revision, NO pod from an older one is left,
@@ -105,9 +113,10 @@ same job and the half that happens far more often.
 
 Needs the platform's admin role: sign in with 'zae login --url …', or carry a
 bearer in ZAE_TOKEN (which wins when it is set).
-Exit codes: 0 done · 1 the instance refused it, the change was declined, or it
-was not ready in time · 2 usage · 3 this instance has no operator console, no
-such workload, or no controller reported · 4 undetermined · 5 forbidden.
+Exit codes: 0 done · 1 the instance refused it, the change was declined, it
+was not ready in time, or a verification failed · 2 usage · 3 this instance has
+no operator console, no such workload, no controller reported, or no
+verification of itself · 4 undetermined · 5 forbidden.
 `)
 }
 
@@ -140,11 +149,13 @@ func Run(args []string) int {
 		return restart(args[1:])
 	case "scale":
 		return scale(args[1:])
+	case "verify":
+		return verify(args[1:])
 	case "help", "--help", "-h":
 		usage(stdout)
 		return exitcode.OK
 	default:
-		errf("usage: zae platform has no command %q — status, controller, update, restart, scale", args[0])
+		errf("usage: zae platform has no command %q — status, controller, update, restart, scale, verify", args[0])
 		return exitcode.Usage
 	}
 }
