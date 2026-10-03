@@ -5,19 +5,48 @@
 // in-cluster but is not published, a registry that refuses anonymous pulls),
 // and each check here corresponds to a real incident that outside-in probing
 // would have caught in seconds.
+//
+// With --sign-in it goes one step further in, and no further than a person
+// does: it signs in through the login page as the web client does, and uses
+// the platform with that token — reading only (signin.go, deep.go). That is
+// what lets a platform verify itself after an update: the operator runs this
+// binary in the platform's namespace as a test account.
 package doctor
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"time"
 )
+
+// Streams are variables so tests can read what a run printed — and prove that
+// no credential is among it.
+var (
+	stdout io.Writer = os.Stdout
+	stderr io.Writer = os.Stderr
+)
+
+// staticChecks is the outside-in suite every run starts with. A variable so
+// the tests of what follows it do not reach the network beyond their own fakes
+// (the registry check asks ghcr.io).
+var staticChecks = func(base *url.URL, realm string) []Result {
+	results := []Result{
+		checkTLS(base),
+		checkRoutes(base),
+	}
+	results = append(results, checkIssuer(base, realm)...)
+	results = append(results, checkRegistry())
+	return append(results, checkDiscovery(base))
+}
 
 // Result is one check's outcome. Remediation is part of the contract: a
 // diagnostic that says only "degraded" makes the reader do the diagnosis —
@@ -66,51 +95,70 @@ func client() *http.Client {
 }
 
 // Run executes the static check suite against a public instance URL and then
-// asks the instance what registered checks it offers. Exit code: 1 if any
-// check FAILed, else 0 (warnings do not fail the run).
+// asks the instance what registered checks it offers; with --sign-in it then
+// signs in and uses the platform. Exit code: 1 if any check FAILed, else 0
+// (warnings and skips do not fail the run).
 func Run(args []string, version string) int {
-	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
+	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 	rawURL := fs.String("url", "", "public URL of the instance (required), e.g. https://media.example.org")
 	realm := fs.String("realm", "zaentrum", "realm name used when the instance does not advertise its issuer")
-	_ = fs.Parse(args)
+	signIn := fs.Bool("sign-in", false, "also sign in the way a person does and use the platform with the token, read-only — as "+
+		UserEnv+"/"+PasswordEnv+" when set, else with the session zae login stored")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() > 0 {
+		// Go's flags stop at the first word that is not one, so everything
+		// after it — a --sign-in — would be ignored without a word.
+		fmt.Fprintf(stderr, "doctor: takes no arguments, only flags (%q, and every flag after it, would be ignored)\n", fs.Arg(0))
+		return 2
+	}
 	if *rawURL == "" {
-		fmt.Fprintln(os.Stderr, "doctor: --url is required (the instance's public address)")
+		fmt.Fprintln(stderr, "doctor: --url is required (the instance's public address)")
 		return 2
 	}
 	base, err := url.Parse(strings.TrimRight(*rawURL, "/"))
 	if err != nil || base.Host == "" {
-		fmt.Fprintf(os.Stderr, "doctor: %q is not a URL\n", *rawURL)
+		fmt.Fprintf(stderr, "doctor: %q is not a URL\n", *rawURL)
 		return 2
 	}
 
-	fmt.Printf("zae %s · doctor · %s\n\n", version, base)
+	fmt.Fprintf(stdout, "zae %s · doctor · %s\n\n", version, base)
 
-	results := []Result{
-		checkTLS(base),
-		checkRoutes(base),
+	results := staticChecks(base, *realm)
+	list(results)
+	if *signIn {
+		more := signedInChecks(context.Background(), base, version)
+		fmt.Fprintln(stdout)
+		list(more)
+		results = append(results, more...)
 	}
-	results = append(results, checkIssuer(base, *realm)...)
-	results = append(results, checkRegistry())
-	results = append(results, checkDiscovery(base))
 
-	worst := OK
+	fmt.Fprintln(stdout)
+	for _, r := range results {
+		if r.Status == Fail {
+			fmt.Fprintln(stdout, "doctor: FAILING — see fixes above")
+			return 1
+		}
+	}
+	fmt.Fprintln(stdout, "doctor: no failures")
+	return 0
+}
+
+// list prints results the way doctor always has: a mark, the name, the
+// detail, and the fix under it.
+func list(results []Result) {
 	for _, r := range results {
 		mark := map[Status]string{OK: "✓", Warn: "!", Fail: "✗", Skip: "-"}[r.Status]
-		fmt.Printf("  %s %-28s %s\n", mark, r.Name, r.Detail)
+		fmt.Fprintf(stdout, "  %s %-28s %s\n", mark, r.Name, r.Detail)
 		if r.Fix != "" {
-			fmt.Printf("      fix: %s\n", r.Fix)
-		}
-		if r.Status == Fail {
-			worst = Fail
+			fmt.Fprintf(stdout, "      fix: %s\n", r.Fix)
 		}
 	}
-	fmt.Println()
-	if worst == Fail {
-		fmt.Println("doctor: FAILING — see fixes above")
-		return 1
-	}
-	fmt.Println("doctor: no failures")
-	return 0
 }
 
 // checkTLS reports certificate health for the public host. Expiry is the
