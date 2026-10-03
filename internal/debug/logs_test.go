@@ -1,0 +1,301 @@
+package debug
+
+import (
+	"encoding/json"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/zaentrum/zae/internal/exitcode"
+)
+
+func TestLogsOfAWorkloadAreItsPodsMergedByTime(t *testing.T) {
+	p, srv := newPortal(t)
+	exampleNamespace(p)
+	code, out, errs := run(t, "logs", "chino-api", "--url", srv.URL)
+	if code != exitcode.OK {
+		t.Fatalf("want 0, got %d\n%s\n%s", code, out, errs)
+	}
+	want := strings.Join([]string{
+		"[chino-api-7d79fd4c4b-xprff/app] " + line(1, "first replica starts"),
+		"[chino-api-7d79fd4c4b-qfmtj/app] " + line(2, "second replica starts"),
+		"[chino-api-7d79fd4c4b-qfmtj/app] " + line(3, "second replica serves"),
+		"[chino-api-7d79fd4c4b-xprff/app] " + line(4, "first replica serves"),
+	}, "\n") + "\n"
+	if out != want {
+		t.Fatalf("both replicas, by time, each line with its pod:\n got:\n%s\nwant:\n%s", out, want)
+	}
+	// The pods of a workload whose name only starts like this one's are not
+	// its pods: "worker" is not a template hash.
+	if strings.Contains(out, "worker") || p.called("GET "+logsPath+"?container=app&pod=chino-api-worker") != 0 {
+		t.Errorf("another workload's pod was read:\n%s", out)
+	}
+	// Every read names its container, and asks for nothing the flags did not.
+	for _, q := range p.logQ {
+		if q.Get("container") == "" || q.Has("tail") || q.Has("since") {
+			t.Errorf("a read asked for %v", q)
+		}
+	}
+}
+
+// One container, one pod: the lines exactly as the portal sent them.
+func TestLogsOfOneContainerAreTheLinesAsSent(t *testing.T) {
+	p, srv := newPortal(t)
+	exampleNamespace(p)
+	for name, want := range map[string]string{
+		"postgres":                    line(1, "database system is ready") + "\n", // a StatefulSet's pod
+		"zaentrum-verify-fzzgp":       line(1, "doctor: no failures") + "\n",      // a Job's
+		"chino-web-58f8548947-ljdwb":  line(1, "web") + "\n",                      // a pod by its own name
+		"chino-api-7d79fd4c4b-qfmtj":  line(2, "second replica starts") + "\n" + line(3, "second replica serves") + "\n",
+		"chino-api-worker":            line(1, "the worker, not the api") + "\n",
+		"portal-api-554bd55786-krtkx": "[portal-api-554bd55786-krtkx/app] " + line(1, "portal app") + "\n[portal-api-554bd55786-krtkx/proxy] " + line(2, "portal proxy") + "\n",
+	} {
+		code, out, errs := run(t, "logs", name, "--url", srv.URL)
+		if code != exitcode.OK || out != want {
+			t.Errorf("%s: want 0 and\n%s\ngot %d\n%s\n%s", name, want, code, out, errs)
+		}
+	}
+	code, out, _ := run(t, "logs", "portal-api", "--container", "proxy", "--url", srv.URL)
+	if code != exitcode.OK || out != line(2, "portal proxy")+"\n" {
+		t.Errorf("--container picks one: %d\n%s", code, out)
+	}
+}
+
+func TestLogsSendsTailAndSince(t *testing.T) {
+	p, srv := newPortal(t)
+	exampleNamespace(p)
+	code, out, errs := run(t, "logs", "postgres", "--url", srv.URL, "--tail", "20", "--since", "90s")
+	if code != exitcode.OK {
+		t.Fatalf("want 0, got %d\n%s\n%s", code, out, errs)
+	}
+	q := p.logQ[0]
+	if q.Get("tail") != "20" || q.Get("since") != "90" || q.Get("pod") != "postgres-0" || q.Get("container") != "postgres" {
+		t.Fatalf("the read: %v", q)
+	}
+	// A part of a second is a whole one: the portal takes seconds, and a
+	// window rounded down would leave out what was asked for.
+	if _, _, _ = run(t, "logs", "postgres", "--url", srv.URL, "--since", "1500ms"); p.logQ[1].Get("since") != "2" {
+		t.Fatalf("--since 1500ms: %v", p.logQ[1])
+	}
+}
+
+// The portal redacts; zae redacts again, with the same rules — here the
+// portal is an older one that let a credential through.
+func TestLogsAreRedactedAgain(t *testing.T) {
+	p, srv := newPortal(t)
+	exampleNamespace(p)
+	p.logs["postgres-0/postgres"] = []string{
+		line(1, "connecting with Authorization: Bearer "+leaked),
+		line(2, "dsn postgres://app:"+leaked+"@postgres:5432/app"),
+		line(3, `config {"clientSecret":"`+leaked+`"}`),
+	}
+	for _, args := range [][]string{
+		{"logs", "postgres", "--url", srv.URL},
+		{"logs", "postgres", "--url", srv.URL, "--json"},
+	} {
+		code, out, errs := run(t, args...)
+		if code != exitcode.OK || strings.Contains(out+errs, leaked) {
+			t.Fatalf("%v: a credential reached the terminal (exit %d):\n%s", args, code, out)
+		}
+		if !strings.Contains(out, "REDACTED") || !strings.Contains(out, "@postgres:5432/app") {
+			t.Errorf("%v: the lines must stay, with the credential replaced:\n%s", args, out)
+		}
+	}
+}
+
+// --json is one object per line, the timestamp apart from the text.
+func TestLogsJSONIsOneObjectPerLine(t *testing.T) {
+	p, srv := newPortal(t)
+	exampleNamespace(p)
+	p.logs["postgres-0/postgres"] = append(p.logs["postgres-0/postgres"], line(2, `a "quoted" <tag> & more`))
+	code, out, errs := run(t, "logs", "postgres", "--url", srv.URL, "--json")
+	if code != exitcode.OK {
+		t.Fatalf("want 0, got %d %s", code, errs)
+	}
+	rows := strings.Split(strings.TrimSpace(out), "\n")
+	if len(rows) != 2 {
+		t.Fatalf("want one object per line:\n%s", out)
+	}
+	var l logLine
+	if err := json.Unmarshal([]byte(rows[1]), &l); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, rows[1])
+	}
+	if l.Pod != "postgres-0" || l.Container != "postgres" || l.Time != at(2) || l.Line != `a "quoted" <tag> & more` {
+		t.Fatalf("the object: %+v", l)
+	}
+	if !strings.Contains(rows[1], "<tag> & more") {
+		t.Errorf("the text is written as it is, not HTML-escaped: %s", rows[1])
+	}
+}
+
+// What is not there is exit 3, and the message says what is.
+func TestLogsOfWhatIsNotThere(t *testing.T) {
+	p, srv := newPortal(t)
+	exampleNamespace(p)
+	code, _, errs := run(t, "logs", "katalog-api", "--url", srv.URL)
+	if code != exitcode.NotOffered {
+		t.Fatalf("an unknown workload: want 3, got %d %q", code, errs)
+	}
+	for _, s := range []string{`no workload named "katalog-api"`, "chino-api, chino-api-worker, chino-web, portal-api, postgres, zaentrum-verify"} {
+		if !strings.Contains(errs, s) {
+			t.Errorf("the message lacks %q: %q", s, errs)
+		}
+	}
+	code, _, errs = run(t, "logs", "portal-api", "--container", "sidecar", "--url", srv.URL)
+	if code != exitcode.NotOffered || !strings.Contains(errs, `no container "sidecar"`) || !strings.Contains(errs, "its containers are app, proxy") {
+		t.Fatalf("an unknown container: want 3 naming the ones there, got %d %q", code, errs)
+	}
+
+	empty, srv2 := newPortal(t)
+	empty.pods = []Pod{}
+	code, _, errs = run(t, "logs", "chino-api", "--url", srv2.URL)
+	if code != exitcode.NotOffered || !strings.Contains(errs, "not running in a cluster") {
+		t.Fatalf("no pods at all: want 3, got %d %q", code, errs)
+	}
+
+	p3, srv3 := newPortal(t)
+	exampleNamespace(p3)
+	p3.logs503 = "log viewer is unavailable (not running in a cluster)"
+	code, _, errs = run(t, "logs", "postgres", "--url", srv3.URL)
+	if code != exitcode.NotOffered || !strings.Contains(errs, "has no pods to read") {
+		t.Fatalf("the portal's own 503: want 3, got %d %q", code, errs)
+	}
+}
+
+// A container the portal cannot read is said, and the others are printed:
+// one pod that is still starting must not hide its siblings.
+func TestLogsPrintsWhatItCouldRead(t *testing.T) {
+	p, srv := newPortal(t)
+	exampleNamespace(p)
+	p.broken["chino-api-7d79fd4c4b-qfmtj/app"] = `k8s 400 BadRequest: container "app" in pod "chino-api-7d79fd4c4b-qfmtj" is waiting to start: ContainerCreating`
+	code, out, errs := run(t, "logs", "chino-api", "--url", srv.URL)
+	if code != exitcode.Failed {
+		t.Fatalf("want 1, got %d\n%s\n%s", code, out, errs)
+	}
+	if !strings.Contains(out, "first replica serves") || !strings.Contains(errs, "is waiting to start") {
+		t.Fatalf("the readable lines and the reason for the rest:\n%s\n%s", out, errs)
+	}
+}
+
+func TestMatchAndWorkloadNames(t *testing.T) {
+	for pod, want := range map[string]string{
+		"chino-api-7d79fd4c4b-xprff":  "chino-api",
+		"chino-api-worker-5c-rhbqb":   "chino-api-worker", // a one-character hash is a hash
+		"postgres-0":                  "postgres",
+		"postgres-12":                 "postgres",
+		"seed-demo-content-xmmqz":     "seed-demo-content",
+		"keycloak":                    "keycloak",
+		"my-pod-abcde":                "my-pod-abcde",    // vowels: not generated
+		"web-07":                      "web-07",          // not an ordinal
+		"api-7d79fd4c4b9-xprff":       "api-7d79fd4c4b9", // eleven characters are no template hash
+		"zaentrum-verify-fzzgp-gsg9z": "zaentrum-verify",
+	} {
+		if got := workloadOf(pod); got != want {
+			t.Errorf("workloadOf(%q) = %q, want %q", pod, got, want)
+		}
+	}
+	pods := []Pod{{Pod: "api-bcd-xprff", Containers: []string{"app"}}, {Pod: "api-bcd", Containers: []string{"app"}}}
+	if srcs, exact := match("api-bcd", "", pods); !exact || len(srcs) != 1 || srcs[0].pod != "api-bcd" {
+		t.Errorf("a pod's own name wins over a workload's: %v %v", srcs, exact)
+	}
+}
+
+// --follow reads every round, prints each line once, and takes up the pods a
+// rollout brings while it says which ones went.
+func TestFollowPrintsEachLineOnceThroughARollout(t *testing.T) {
+	p, srv := newPortal(t)
+	exampleNamespace(p)
+	p.onList = func(p *fakePortal, n int) {
+		a := "chino-api-7d79fd4c4b-xprff/app"
+		switch n {
+		case 2:
+			p.logs[a] = append(p.logs[a], line(5, "first replica, later"))
+		case 3:
+			// The rollout: one old replica is gone, its replacement is up.
+			p.pods = append([]Pod{{Pod: "chino-api-5f6d8c9b7d-wv2bn", Phase: "Running", Containers: []string{"app"}}}, p.pods[1:]...)
+			p.logs["chino-api-5f6d8c9b7d-wv2bn/app"] = []string{line(6, "new replica starts")}
+		case 4:
+			k := "chino-api-5f6d8c9b7d-wv2bn/app"
+			p.logs[k] = append(p.logs[k], line(7, "new replica serves"))
+		case 6:
+			go interrupt()
+		}
+	}
+	code, out, errs := run(t, "logs", "chino-api", "--url", srv.URL, "--follow")
+	if code != 130 {
+		t.Fatalf("Ctrl-C ends a follow with 130, got %d\n%s\n%s", code, out, errs)
+	}
+	want := []string{
+		"[chino-api-7d79fd4c4b-xprff/app] " + line(1, "first replica starts"),
+		"[chino-api-7d79fd4c4b-qfmtj/app] " + line(2, "second replica starts"),
+		"[chino-api-7d79fd4c4b-qfmtj/app] " + line(3, "second replica serves"),
+		"[chino-api-7d79fd4c4b-xprff/app] " + line(4, "first replica serves"),
+		"[chino-api-7d79fd4c4b-xprff/app] " + line(5, "first replica, later"),
+		"[chino-api-5f6d8c9b7d-wv2bn/app] " + line(6, "new replica starts"),
+		"[chino-api-5f6d8c9b7d-wv2bn/app] " + line(7, "new replica serves"),
+	}
+	if got := strings.Split(strings.TrimSpace(out), "\n"); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("each line once, in order:\n got:\n%s\nwant:\n%s", out, strings.Join(want, "\n"))
+	}
+	for _, s := range []string{"chino-api-7d79fd4c4b-xprff/app is gone", "following chino-api-5f6d8c9b7d-wv2bn/app too"} {
+		if !strings.Contains(errs, s) {
+			t.Errorf("the notes lack %q: %q", s, errs)
+		}
+	}
+	// After the first read, each one asks for the window since the last —
+	// a few seconds, not the whole log again — and as many lines as the
+	// portal gives.
+	for _, q := range p.logQ[2:] {
+		since, _ := strconv.Atoi(q.Get("since"))
+		if q.Get("tail") != strconv.Itoa(maxTail) || since < 1 || since > 8 {
+			t.Errorf("a follow read asked for %v", q)
+		}
+	}
+}
+
+// A failure that passes is said once and followed through; a refusal ends
+// the follow with its own exit code.
+func TestFollowRidesOutAFailureAndStopsAtARefusal(t *testing.T) {
+	p, srv := newPortal(t)
+	exampleNamespace(p)
+	k := "postgres-0/postgres"
+	p.onList = func(p *fakePortal, n int) {
+		switch n {
+		case 2, 3, 4:
+			p.broken[k] = "k8s 503 ServiceUnavailable: the kubelet did not answer"
+		case 5:
+			delete(p.broken, k)
+			p.logs[k] = append(p.logs[k], line(9, "after the hiccup"))
+		case 7:
+			p.token = "someone-else" // the session lost its role
+		}
+	}
+	code, out, errs := run(t, "logs", "postgres", "--url", srv.URL, "--follow")
+	if code != exitcode.Forbidden {
+		t.Fatalf("a refusal ends the follow with 5, got %d\n%s\n%s", code, out, errs)
+	}
+	if n := strings.Count(errs, "the kubelet did not answer"); n != 1 {
+		t.Errorf("a repeated failure is said once, said %d times:\n%s", n, errs)
+	}
+	if !strings.Contains(errs, "reading postgres-0/postgres again") || !strings.Contains(out, "after the hiccup") {
+		t.Errorf("the follow must recover and say so:\n%s\n%s", out, errs)
+	}
+	if strings.Count(out, "database system is ready") != 1 {
+		t.Errorf("the line from before the failure is printed once:\n%s", out)
+	}
+}
+
+func TestLogsUsage(t *testing.T) {
+	p, srv := newPortal(t)
+	exampleNamespace(p)
+	usageCases(t, p, map[string][]string{
+		"no name":                {"logs", "--url", srv.URL},
+		"two names":              {"logs", "a", "b", "--url", srv.URL},
+		"not a name":             {"logs", "Chino_API", "--url", srv.URL},
+		"no url":                 {"logs", "postgres"},
+		"tail zero":              {"logs", "postgres", "--url", srv.URL, "--tail", "0"},
+		"tail beyond the portal": {"logs", "postgres", "--url", srv.URL, "--tail", "5001"},
+		"since zero":             {"logs", "postgres", "--url", srv.URL, "--since", "0s"},
+		"a bad container":        {"logs", "postgres", "--url", srv.URL, "--container", "Bad Name"},
+	})
+}

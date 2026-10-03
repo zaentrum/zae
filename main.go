@@ -29,6 +29,7 @@ import (
 
 	"github.com/zaentrum/zae/internal/addon"
 	"github.com/zaentrum/zae/internal/auth"
+	"github.com/zaentrum/zae/internal/debug"
 	"github.com/zaentrum/zae/internal/doctor"
 	"github.com/zaentrum/zae/internal/exitcode"
 	"github.com/zaentrum/zae/internal/invoke"
@@ -57,6 +58,8 @@ Usage:
   zae platform controller --url https://…          the operator's own controller, and what updates it
   zae platform update|restart|scale …              drive platform updates ('zae platform help')
   zae platform verify --url https://… [--wait]     ask the platform to verify itself now
+  zae debug logs <workload> --url https://… [--follow] [--since 10m]
+                                                   a workload's container logs, redacted
   zae <service> <command> --url https://… [--arg k=v] [--query k=v] [--data JSON]
   zae version
 
@@ -104,6 +107,10 @@ func main() {
 		// Static for the same reason: the platform's own version is what
 		// every declared command depends on, so it cannot be declared by one.
 		os.Exit(platform.Run(os.Args[2:]))
+	case "debug":
+		// Static like doctor: a platform's logs are read when something is
+		// wrong with it, which is when it may not be able to declare anything.
+		os.Exit(debug.Run(os.Args[2:], version))
 	case "help", "--help", "-h":
 		usage()
 	default:
