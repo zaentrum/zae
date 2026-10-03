@@ -18,6 +18,7 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -175,6 +176,12 @@ func Login(args []string) int {
 	fmt.Fprintf(stdout, "\nsigned in to %s\n", base)
 	if parsed {
 		fmt.Fprintf(stdout, "  as         %s\n", identity(claims))
+	}
+	// Whether this sign-in makes an admin is the instance's to say; an older
+	// portal-api cannot, and then the token is read.
+	if m, how, _ := askMe(ctx, base, tok.AccessToken); how == meAnswered {
+		fmt.Fprintf(stdout, "  admin role %s\n", m.adminLine())
+	} else if parsed {
 		fmt.Fprintf(stdout, "  admin role %s\n", roleState(claims))
 	}
 	if !tok.Expiry.IsZero() {
@@ -441,21 +448,29 @@ func endSession(ctx context.Context, base string, e creds.Entry) int {
 	}
 }
 
-// Whoami runs `zae whoami --url https://…`: who the bearer zae would send
-// says it is, and whether it carries the platform's admin role.
+// Whoami runs `zae whoami --url https://…`: who the instance says the bearer
+// zae would send is, and whether it grants that bearer its admin role.
 //
-// It reads the token's own claims and never prints the token. What it says is
-// what the token CLAIMS; the instance verifies it on every call, which is why
-// a `whoami` that looks right can still be refused — and why that refusal
-// names a missing role rather than a missing login.
+// It ASKS (GET /api/portal/me): which role makes an admin is the instance's
+// setting, and a portal may take that role only on tokens issued to its own
+// clients — neither is in the token. Against a portal-api older than the
+// answer, and when the instance cannot be reached, it reads the token's own
+// claims as before and says that it did. It never prints the token.
+//
+// Exit codes: 0 answered (or read from the token, from an older portal), 4
+// the instance could not be asked, 5 no credentials, or the instance refused
+// the bearer.
 func Whoami(args []string) int {
 	fs := flag.NewFlagSet("whoami", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	rawURL := fs.String("url", "", "public URL of the instance (required)")
-	role := fs.String("role", instance.AdminRole, "the realm role to report on")
+	role := fs.String("role", instance.AdminRole, "a realm role to report on as well — and, against an older portal, the admin role to look for in the token")
+	asJSON := fs.Bool("json", false, "print the answer as JSON")
 	if err := fs.Parse(args); err != nil {
 		return exitcode.Usage
 	}
+	roleSet := false
+	fs.Visit(func(f *flag.Flag) { roleSet = roleSet || f.Name == "role" })
 	base, err := instance.Base(*rawURL)
 	if err != nil {
 		errf("usage: %v", err)
@@ -468,37 +483,178 @@ func Whoami(args []string) int {
 		return exitcode.Failed
 	}
 	env := strings.TrimSpace(os.Getenv(instance.TokenEnv))
-	token, source := env, instance.TokenEnv
-	if token == "" {
-		if !stored {
-			errf("forbidden: no credentials for %s — run: zae login --url %s, or supply a bearer via %s", base, base, instance.TokenEnv)
-			return exitcode.Forbidden
-		}
-		token, source = entry.AccessToken, "the stored session"
+	if env == "" && !stored {
+		errf("forbidden: no credentials for %s — run: zae login --url %s, or supply a bearer via %s", base, base, instance.TokenEnv)
+		return exitcode.Forbidden
 	}
 
-	fmt.Fprintf(stdout, "%s\n  bearer from %s\n", base, source)
-	if stored && env != "" {
+	ctx, stop := interruptible()
+	defer stop()
+	m, how, said := askMe(ctx, base, "")
+	if ctx.Err() != nil {
+		return interrupted()
+	}
+	if how == meNoSession {
+		errf("forbidden: %s", said)
+		return exitcode.Forbidden
+	}
+	// Asking renews an expired session and writes it back: read what is
+	// stored now.
+	if env == "" {
+		entry, _, _ = creds.Get(base)
+	}
+	w := whoami{base: base, env: env != "", stored: stored, entry: entry, me: m, role: *role, roleSet: roleSet}
+	w.token = entry.AccessToken
+	if env != "" {
+		w.token = env
+	}
+	w.claims, w.jwt = oidc.ParseClaims(w.token)
+
+	if *asJSON {
+		w.printJSON()
+	} else {
+		w.print(how)
+	}
+	switch how {
+	case meRefused:
+		errf("forbidden: %s refuses this bearer (%s) — %s", base, said, instance.ForbiddenHint(base, ""))
+		return exitcode.Forbidden
+	case meUnreachable:
+		errf("undetermined: cannot ask %s who this bearer is (%s) — shown is what the token itself claims; the instance decides", base, said)
+		return exitcode.Undetermined
+	}
+	return exitcode.OK
+}
+
+// whoami is what Whoami found out, to print.
+type whoami struct {
+	base        string
+	env, stored bool
+	entry       creds.Entry
+	token       string
+	claims      *oidc.Claims
+	jwt         bool
+	me          *me
+	role        string
+	roleSet     bool
+}
+
+func (w *whoami) source() string {
+	if w.env {
+		return instance.TokenEnv
+	}
+	return "the stored session"
+}
+
+// expiry is when the bearer stops working: the token's own exp, else what the
+// identity provider said when it issued the stored one.
+func (w *whoami) expiry() time.Time {
+	if w.jwt && !w.claims.Expiry.IsZero() {
+		return w.claims.Expiry
+	}
+	if !w.env {
+		return w.entry.Expiry
+	}
+	return time.Time{}
+}
+
+func (w *whoami) print(how meOutcome) {
+	fmt.Fprintf(stdout, "%s\n  bearer from %s\n", w.base, w.source())
+	if w.stored && w.env {
 		fmt.Fprintf(stdout, "              (a stored session exists too; %s wins)\n", instance.TokenEnv)
 	}
-	if stored && env == "" {
-		fmt.Fprintf(stdout, "  issuer      %s\n  client      %s\n", entry.Issuer, entry.ClientID)
+	if !w.env {
+		fmt.Fprintf(stdout, "  issuer      %s\n  client      %s\n", w.entry.Issuer, w.entry.ClientID)
+	} else if w.me != nil && w.me.Client != "" {
+		fmt.Fprintf(stdout, "  client      %s\n", w.me.Client)
 	}
-
-	claims, ok := oidc.ParseClaims(token)
-	if !ok {
+	if w.jwt {
+		fmt.Fprintf(stdout, "  subject     %s\n", orUnset(w.claims.Subject))
+	}
+	switch {
+	case w.me != nil:
+		fmt.Fprintf(stdout, "  username    %s\n", orUnset(w.me.Username))
+		fmt.Fprintf(stdout, "  admin role  %s\n", w.me.adminLine())
+		if len(w.me.Roles) > 0 {
+			fmt.Fprintf(stdout, "  roles       %s\n", strings.Join(w.me.Roles, ", "))
+		}
+		if w.roleSet {
+			fmt.Fprintf(stdout, "  role        %s\n", listed(w.me.Roles, w.role))
+		}
+	case !w.jwt:
 		// An opaque token is a legitimate thing for a provider to issue; zae
 		// cannot read it, and saying so beats guessing.
 		fmt.Fprintln(stdout, "  identity    cannot be read from this token (it is not a JWT) — the instance still validates it")
-		return exitcode.OK
+	default:
+		if how == meOlder {
+			fmt.Fprintln(stdout, "  answered    by the token itself — this portal-api does not say who a bearer is (GET /api/portal/me)")
+		}
+		fmt.Fprintf(stdout, "  username    %s\n", orUnset(w.claims.Username))
+		fmt.Fprintf(stdout, "  admin role  %s\n", roleStateFor(w.claims, w.role))
 	}
-	fmt.Fprintf(stdout, "  subject     %s\n", orUnset(claims.Subject))
-	fmt.Fprintf(stdout, "  username    %s\n", orUnset(claims.Username))
-	fmt.Fprintf(stdout, "  admin role  %s\n", roleStateFor(claims, *role))
-	if !claims.Expiry.IsZero() {
-		fmt.Fprintf(stdout, "  expires     %s%s\n", claims.Expiry.Local().Format(time.RFC1123), expiryNote(claims.Expiry, stored && env == "" && entry.RefreshToken != ""))
+	if exp := w.expiry(); !exp.IsZero() {
+		fmt.Fprintf(stdout, "  expires     %s%s\n", exp.Local().Format(time.RFC1123), expiryNote(exp, !w.env && w.entry.RefreshToken != ""))
 	}
-	return exitcode.OK
+}
+
+// listed says whether the instance lists a role for this bearer.
+func listed(roles []string, role string) string {
+	for _, r := range roles {
+		if r == role {
+			return fmt.Sprintf("%q — yes, the instance lists it", role)
+		}
+	}
+	return fmt.Sprintf("%q — no, the instance does not list it", role)
+}
+
+// whoamiDoc is whoami as --json prints it. From says who answered: the
+// instance, or — against an older or unreachable one — the token itself.
+type whoamiDoc struct {
+	URL       string   `json:"url"`
+	Bearer    string   `json:"bearer"`
+	Issuer    string   `json:"issuer,omitempty"`
+	ClientID  string   `json:"clientId,omitempty"`
+	Subject   string   `json:"subject,omitempty"`
+	Username  string   `json:"username,omitempty"`
+	Roles     []string `json:"roles"`
+	Admin     bool     `json:"admin"`
+	AdminRole string   `json:"adminRole,omitempty"`
+	From      string   `json:"from"`
+	Expires   string   `json:"expires,omitempty"`
+}
+
+func (w *whoami) printJSON() {
+	d := whoamiDoc{URL: w.base, Bearer: "session", Roles: []string{}}
+	if w.env {
+		d.Bearer = instance.TokenEnv
+	} else {
+		d.Issuer, d.ClientID = w.entry.Issuer, w.entry.ClientID
+	}
+	if w.jwt {
+		d.Subject = w.claims.Subject
+	}
+	switch {
+	case w.me != nil:
+		d.From, d.Username, d.Admin, d.AdminRole = "instance", w.me.Username, *w.me.IsAdmin, w.me.AdminRole
+		if w.me.Roles != nil {
+			d.Roles = w.me.Roles
+		}
+		if w.env && w.me.Client != "" {
+			d.ClientID = w.me.Client
+		}
+	case w.jwt:
+		d.From, d.Username, d.Admin, d.AdminRole = "token", w.claims.Username, w.claims.HasRole(w.role), w.role
+		if w.claims.Roles != nil {
+			d.Roles = w.claims.Roles
+		}
+	default:
+		d.From = "nothing"
+	}
+	if exp := w.expiry(); !exp.IsZero() {
+		d.Expires = exp.UTC().Format(time.RFC3339)
+	}
+	b, _ := json.Marshal(d)
+	fmt.Fprintln(stdout, string(b))
 }
 
 func orUnset(s string) string {
