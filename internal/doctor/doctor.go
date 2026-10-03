@@ -10,7 +10,8 @@
 // does: it signs in through the login page as the web client does, and uses
 // the platform with that token — reading only (signin.go, deep.go). That is
 // what lets a platform verify itself after an update: the operator runs this
-// binary in the platform's namespace as a test account.
+// binary in the platform's namespace as a test account, and --report hands it
+// the outcome as data (report.go).
 package doctor
 
 import (
@@ -105,6 +106,7 @@ func Run(args []string, version string) int {
 	realm := fs.String("realm", "zaentrum", "realm name used when the instance does not advertise its issuer")
 	signIn := fs.Bool("sign-in", false, "also sign in the way a person does and use the platform with the token, read-only — as "+
 		UserEnv+"/"+PasswordEnv+" when set, else with the session zae login stored")
+	report := fs.String("report", "", "write a compact JSON summary of the run to this file — at most 4096 bytes, so it fits /dev/termination-log")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -113,7 +115,7 @@ func Run(args []string, version string) int {
 	}
 	if fs.NArg() > 0 {
 		// Go's flags stop at the first word that is not one, so everything
-		// after it — a --sign-in — would be ignored without a word.
+		// after it — a --sign-in, a --report — would be ignored without a word.
 		fmt.Fprintf(stderr, "doctor: takes no arguments, only flags (%q, and every flag after it, would be ignored)\n", fs.Arg(0))
 		return 2
 	}
@@ -136,6 +138,14 @@ func Run(args []string, version string) int {
 		fmt.Fprintln(stdout)
 		list(more)
 		results = append(results, more...)
+	}
+
+	if *report != "" {
+		if err := writeReport(*report, version, base.String(), results); err != nil {
+			// The run's verdict is the run's: a report that could not be written
+			// is said, and does not change what the platform did.
+			fmt.Fprintf(stderr, "doctor: could not write the report to %s: %v\n", *report, err)
+		}
 	}
 
 	fmt.Fprintln(stdout)
