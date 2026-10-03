@@ -1,5 +1,6 @@
 // Package debug is `zae debug`: the portal's debug console, from a terminal —
-// a workload's container logs, and what the platform's event bus carried.
+// a workload's container logs, what the platform's event bus carried, and the
+// support bundle an administrator attaches to a bug report.
 //
 // These are STATIC commands, like `zae addon` and `zae platform`: they read
 // the portal's own debug API (GET /api/portal/debug/…), which an instance has
@@ -52,6 +53,7 @@ Usage:
   zae debug logs <workload|pod> --url https://… [--container C] [--tail N] [--since 10m]
       [--follow] [--json]
   zae debug events --url https://… [--topic T] [--limit N] [--payload] [--json]
+  zae debug bundle -o FILE|- --url https://… [--without logs,instances,kafka,registry,config,client]
 
 logs prints a workload's container logs: the pods Kubernetes names for a
 Deployment (or a StatefulSet, DaemonSet or Job) of that name — or one pod, by
@@ -64,6 +66,12 @@ pods a rollout replaces them with. --json prints one object per line.
 events prints what the portal's event tap has read from the platform's bus —
 it reads from the moment portal-api started, at most the last 500 — oldest
 first. --topic picks one topic, --payload adds each event's payload.
+
+bundle writes the portal's support bundle — workload and operator state, every
+container's recent logs, the bus topology, the launchpad registry and the
+non-secret runtime settings — with a section about this zae, to FILE (mode
+0600, never over a file that exists) or, with -o -, to stdout. --without
+leaves sections out.
 
 Everything comes through the portal's debug API and is redacted there; zae
 redacts it again with the portal's own rules before it prints or writes it.
@@ -95,7 +103,8 @@ func usageErr(format string, a ...any) int {
 	return exitcode.Usage
 }
 
-// Run executes `zae debug <command> [args]`.
+// Run executes `zae debug <command> [args]`. version names this zae in the
+// support bundle's own section.
 func Run(args []string, version string) int {
 	if len(args) == 0 {
 		usage(stderr)
@@ -106,11 +115,13 @@ func Run(args []string, version string) int {
 		return logs(args[1:])
 	case "events":
 		return events(args[1:])
+	case "bundle":
+		return bundle(args[1:], version)
 	case "help", "--help", "-h":
 		usage(stdout)
 		return exitcode.OK
 	default:
-		errf("usage: zae debug has no command %q — logs, events", args[0])
+		errf("usage: zae debug has no command %q — logs, events, bundle", args[0])
 		return exitcode.Usage
 	}
 }

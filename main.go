@@ -60,7 +60,7 @@ Usage:
   zae platform verify --url https://… [--wait]     ask the platform to verify itself now
   zae debug logs <workload> --url https://… [--follow] [--since 10m]
                                                    a workload's container logs, redacted
-  zae debug events --url https://… [--topic T]     what the platform's event bus carried ('zae debug help')
+  zae debug events|bundle …                        the event tap, the support bundle ('zae debug help')
   zae <service> <command> --url https://… [--arg k=v] [--query k=v] [--data JSON]
   zae version
 
