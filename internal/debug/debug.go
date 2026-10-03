@@ -1,5 +1,5 @@
 // Package debug is `zae debug`: the portal's debug console, from a terminal —
-// to begin with, a workload's container logs.
+// a workload's container logs, and what the platform's event bus carried.
 //
 // These are STATIC commands, like `zae addon` and `zae platform`: they read
 // the portal's own debug API (GET /api/portal/debug/…), which an instance has
@@ -51,6 +51,7 @@ func usage(w io.Writer) {
 Usage:
   zae debug logs <workload|pod> --url https://… [--container C] [--tail N] [--since 10m]
       [--follow] [--json]
+  zae debug events --url https://… [--topic T] [--limit N] [--payload] [--json]
 
 logs prints a workload's container logs: the pods Kubernetes names for a
 Deployment (or a StatefulSet, DaemonSet or Job) of that name — or one pod, by
@@ -60,6 +61,10 @@ lines per container (the portal's default is 500, its most 5000); --since
 keeps only newer lines. --follow keeps reading until Ctrl-C, and takes up the
 pods a rollout replaces them with. --json prints one object per line.
 
+events prints what the portal's event tap has read from the platform's bus —
+it reads from the moment portal-api started, at most the last 500 — oldest
+first. --topic picks one topic, --payload adds each event's payload.
+
 Everything comes through the portal's debug API and is redacted there; zae
 redacts it again with the portal's own rules before it prints or writes it.
 Nothing here writes to the instance.
@@ -67,8 +72,8 @@ Nothing here writes to the instance.
 Needs the platform's admin role: sign in with 'zae login --url …', or carry a
 bearer in ZAE_TOKEN (which wins when it is set).
 Exit codes: 0 done · 1 the instance returned an error · 2 usage · 3 not offered
-(no such workload or container; no cluster) · 4 undetermined · 5 forbidden ·
-130/143 interrupted.
+(no such workload, container or topic; no cluster, no event bus) · 4
+undetermined · 5 forbidden · 130/143 interrupted.
 `)
 }
 
@@ -99,11 +104,13 @@ func Run(args []string, version string) int {
 	switch args[0] {
 	case "logs":
 		return logs(args[1:])
+	case "events":
+		return events(args[1:])
 	case "help", "--help", "-h":
 		usage(stdout)
 		return exitcode.OK
 	default:
-		errf("usage: zae debug has no command %q — logs", args[0])
+		errf("usage: zae debug has no command %q — logs, events", args[0])
 		return exitcode.Usage
 	}
 }
