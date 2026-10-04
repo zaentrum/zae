@@ -306,6 +306,26 @@ func TestMetadataWhereTheCatalogDoesNotTakeIt(t *testing.T) {
 	}
 }
 
+// With everything else in order — a file that holds a good key, --yes — an
+// argument is still refused, not ignored, and so is a second source: a key
+// piped in beside --tmdb-key-file is not quietly preferred to it.
+func TestMetadataRefusesAnArgumentOrTwoSourcesWhateverElseIsRight(t *testing.T) {
+	p, srv := newPortal(t, freshBox())
+	file := keyFile(t, tmdbKey)
+	code, out, errs := run(t, "metadata", "--url", srv.URL, "--tmdb-key-file", file, "--yes", tmdbKey)
+	if code != exitcode.Usage {
+		t.Errorf("an argument beside a good file: want 2, got %d %q", code, errs)
+	}
+	noKey(t, "an argument beside a good file", out, errs)
+	code, _, errs = runWith(t, tmdbKey+"\n", false, "metadata", "--url", srv.URL, "--tmdb-key-file", file, "--tmdb-key-stdin", "--yes")
+	if code != exitcode.Usage || !strings.Contains(errs, "give one") {
+		t.Errorf("a key piped in beside a file: want 2, got %d %q", code, errs)
+	}
+	if len(p.calls) != 0 {
+		t.Fatalf("a refused invocation reaches no instance: %v", p.calls)
+	}
+}
+
 func TestMetadataUsage(t *testing.T) {
 	p, srv := newPortal(t, freshBox())
 	file := keyFile(t, tmdbKey)

@@ -48,6 +48,9 @@ type fakePortal struct {
 	// refuseSinceTime answers a read that names sinceTime 400, with these
 	// words: a portal that refuses the parameter rather than ignoring it.
 	refuseSinceTime string
+	// noLogsRoute is a portal-api whose router serves the pods and not their
+	// logs: its own 404, which is no pod gone.
+	noLogsRoute bool
 	// logs503 answers every log read with 503 and this body.
 	logs503 string
 
@@ -90,6 +93,10 @@ func newPortal(t *testing.T) (*fakePortal, *httptest.Server) {
 		p.calls = append(p.calls, r.Method+" "+r.URL.Path+"?"+r.URL.RawQuery)
 		if p.token != "" && r.Header.Get("Authorization") != "Bearer "+p.token {
 			http.Error(w, "forbidden: requires the zaentrum-admin role", http.StatusForbidden)
+			return
+		}
+		if p.noLogsRoute && r.URL.Path == logsPath {
+			http.NotFound(w, r)
 			return
 		}
 		mux.ServeHTTP(w, r)
@@ -326,6 +333,15 @@ func TestLogsRefusalsAndOldPortals(t *testing.T) {
 	if code, _, errs := run(t, "logs", "postgres", "--url", old.URL); code != exitcode.NotOffered || !strings.Contains(errs, "does not serve "+podsPath) {
 		t.Errorf("a portal-api without the debug API: want 3, got %d %q", code, errs)
 	}
+	// The router's 404 for the logs route is a route that is not there, not
+	// a pod that went: the same 3 for every pod, and no note about any.
+	p.noLogsRoute = true
+	t.Setenv(instance.TokenEnv, "admin-bearer")
+	if code, _, errs := run(t, "logs", "chino-api", "--url", srv.URL); code != exitcode.NotOffered ||
+		!strings.Contains(errs, "does not serve "+logsPath+" — its portal-api predates it") || strings.Contains(errs, "is gone") {
+		t.Errorf("a portal-api without the logs route: want 3 saying so, got %d %q", code, errs)
+	}
+	p.noLogsRoute = false
 	if code, _, errs := run(t, "logs", "postgres", "--url", "http://127.0.0.1:1"); code != exitcode.Undetermined || !strings.Contains(errs, "not concluding") {
 		t.Errorf("unreachable: want 4, got %d %q", code, errs)
 	}
