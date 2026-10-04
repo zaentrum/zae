@@ -1,9 +1,10 @@
 # zae — the zaentrum CLI
 
 `zae` talks to a [zaentrum](https://github.com/zaentrum/zaentrum) instance from
-where you stand: it validates an installation outside-in, adds addons from
-their Helm charts or by their address, drives the platform's updates, reads
-its logs and events, and grows its command surface **from the instance itself**.
+where you stand: it validates an installation outside-in, walks a fresh one
+through its first-run setup, adds addons from their Helm charts or by their
+address, drives the platform's updates, reads its logs and events, and grows
+its command surface **from the instance itself**.
 
 ```
 $ zae doctor --url https://media.example.org
@@ -60,7 +61,8 @@ The binary splits in two, and the split is the point:
   line; a diagnostic that only says "degraded" makes you do the diagnosis.
   `addon` is static for the same reason: an addon cannot declare the command
   that installs it. So is `debug`: a platform's logs are read when something
-  is wrong with it.
+  is wrong with it. And `setup`: a fresh platform has nothing installed that
+  could declare a command.
 - **Discovered surface** — services and addons declare commands, checks and
   topics in capability descriptors; the instance aggregates them and `zae`
   renders them at runtime. Installing an addon extends the CLI; uninstalling
@@ -276,10 +278,12 @@ installed sample: 1 tile, 1 slot row, 2 CLI commands, 1 container
   registered again by the portal itself; refreshing one is a usage error that
   names `upgrade`.
 - **`status`** asks the chart API first and, when it has no addon by that name,
-  reads the addons list: where it was added from, the version its manifest
-  reports, what it registers, its containers with their live state, and its
-  setup — asked of the addon itself through the portal's app proxy, as the
-  console does. `--json` prints the list's row for it.
+  reads that addon's row (`GET /api/portal/addons/{key}`, exactly as the list
+  has it — a portal-api older than that read has only the list, which is read
+  instead): where it was added from, the version its manifest reports, what it
+  registers, its containers with their live state, and its setup — asked of
+  the addon itself through the portal's app proxy, as the console does.
+  `--json` prints the row.
 - **`remove`** says the platform does not delete containers, and repeats what
   the portal says still runs.
 - `http://` is an address — charts are fetched over https only, and a link to
@@ -425,6 +429,83 @@ the platform reports 1.5.0, and every workload the operator manages is ready
   its workloads at all (it is not running in a cluster), has no operator for
   what needs one, or runs no workload by that name.
 
+## First-run setup — `zae setup`
+
+A fresh platform has a first-run checklist: the launchpad shows it to an
+admin until one marks setup done. `zae setup` reads the same checklist —
+`GET /api/portal/setup`, admin-only, each step read live from where it is
+configured: the catalog, the operator's resource, the cluster — and works
+through it:
+
+```
+$ zae setup --url https://media.example.org
+https://media.example.org — first-run setup · 2 of 4 steps done
+  metadata     to do — no TMDB key — titles keep their file names, and get no posters or plots
+               next: zae setup metadata --tmdb-key-file FILE --url https://media.example.org
+                     FILE holds TMDB's API read access token (v4, it starts with eyJ)
+  library      to do — no titles yet
+               no scan has run yet
+               copy files into the media/ folder of the media volume — the catalog reads it as /var/lib/katalog/media — then scan
+               next: copy files there, then zae setup scan --url https://media.example.org
+  processing   optional — the media pipeline is off — files stream as they are
+               GPU: no node offers one, which the transcoder needs
+               next: zae setup pipeline on --url https://media.example.org — it analyzes, transcodes and packages titles for adaptive streaming
+  devices      done — phones and TVs can sign in: media.example.org answers over https
+  people       manual — accounts for the people who use this server are made in the identity provider's admin console; nothing here checks them
+               read: https://github.com/zaentrum/zaentrum/blob/main/docs/self-hosting.md#the-admin-console
+  marked done  no — the launchpad shows this checklist to admins until it is
+               next, once you are done: zae setup done --url https://media.example.org
+
+$ zae setup metadata --tmdb-key-file ~/tmdb.token --url https://media.example.org
+https://media.example.org — the catalog's TMDB key
+  now          none — titles keep their file names, and get no posters or plots
+  sets         the key read from the file --tmdb-key-file names, to the catalog manager's setting — it is never shown again
+set the TMDB key on https://media.example.org? [y/N] y
+set the TMDB key on https://media.example.org
+  metadata     done — a TMDB key is set, saved just now
+```
+
+| command | does |
+|---|---|
+| `zae setup --url …` | the checklist: each step's state — `done`, `to do`, `scanning` or `starting`, `optional`, `manual`, or `unknown` with the portal's reason — and what to do next. People is nothing the platform can check and does not count towards done; a pipeline that is off is fine off. `--json` prints the portal's own document |
+| `zae setup metadata --url … --tmdb-key-file FILE` | sets the catalog's TMDB key — TMDB's API read access token (v4) — through the portal, which hands it to the catalog manager and never stores, logs or answers it. `--tmdb-key-stdin` reads it from stdin instead: a line typed without echo on a terminal, or everything piped in |
+| `zae setup scan --url …` | the catalog manager scans the library — unless a scan is under way, which it waits out as the console's button does; one that has run for half an hour has most likely stopped, and another is started |
+| `zae setup pipeline on\|off --url …` | switches the media pipeline — analyzer, katalog-ingest, packager, transcoder — on the operator's resource (`PATCH /api/portal/operator {"pipeline": …}`, the operator console's write) |
+| `zae setup done --url …` | marks setup done, so the launchpad stops showing the checklist |
+| `zae setup reopen --url …` | shows it again |
+
+- **The key never travels on the command line.** There is no flag that takes
+  it: an argument would be kept in shell history and shown in the process
+  list. An argument that may be the key is refused without being repeated —
+  and so is one given as the value of a flag that takes none, and the path a
+  failing `--tmdb-key-file` names, which could be the key typed in the wrong
+  place. zae never prints the key: not in the summary before the question,
+  not in an error, not where it quotes the portal — which never answers with
+  it, and zae does not rely on that. On a terminal, `--tmdb-key-stdin` turns
+  echo off, and back on however the line ends, Ctrl-C included (`130`).
+- **What cannot be a key is refused before anything is sent** (`2`): empty,
+  longer than the portal takes, holding whitespace or control characters —
+  and TMDB's API key (v3), 32 hex digits, which the portal would take and
+  TMDB refuse when the catalog signs in with it, without a word. A byte order
+  mark and surrounding whitespace are trimmed.
+- **Asking.** `metadata` and `pipeline` print what changes — the key in effect
+  and where the new one was read from; what starts or stops, and whether a
+  node offers the GPU the transcoder needs — and ask on stdin; so does `done`
+  while steps are open, naming them. Without a terminal they need `--yes`, and
+  exit `2` before anything is read or written; piped into
+  `--tmdb-key-stdin`, stdin cannot carry the answer as well, so `--yes` is
+  needed there too. `scan` and `reopen` do not ask, as the console does not.
+  A pipeline already as asked, setup already done or already open: nothing is
+  written, exit `0`.
+- **Through the catalog manager.** The key and a scan reach the catalog
+  manager through the portal, with the admin's own bearer. No catalog manager
+  is `3` — said before asking; one that refuses the admin `5`; one that does
+  not answer `4`, since the portal took the write and cannot say whether it
+  arrived; one that answers an error `1`.
+- Exit codes follow the contract below: `3` also means a portal-api older than
+  the checklist, or than the pipeline switch, and an instance with no
+  operator's resource to switch the pipeline on; `5` without the admin role.
+
 ## The debug console — `zae debug`
 
 The portal's debug console reads every container's log, the platform's event
@@ -455,26 +536,47 @@ TIME                  TOPIC                TYPE   ITEM    AT
   portal-api older than a fix to them — or a field it does not scrub, like an
   event's key — still does not put a credential in a terminal or a file. JSON
   is redacted value by value and stays JSON.
-- **A workload's pods are found by their names.** The portal lists pods
-  without their owners, so zae reads the names Kubernetes gives them —
-  `<name>-<template hash>-<suffix>` for a Deployment's, `<name>-<suffix>` for
-  a Job's or a DaemonSet's, `<name>-<ordinal>` for a StatefulSet's — with the
-  generated parts in Kubernetes' own alphabet, which keeps `chino-api` from
-  claiming `chino-api-worker`'s pods. A pod's own name works too, and so does a
-  verification's job, as `status` names it.
+- **A workload's pods are found by their owner.** The portal names the
+  workload that runs each pod, from its owner references — the Deployment
+  behind a ReplicaSet, a StatefulSet, a DaemonSet, a Job — and a workload's
+  pods are the ones it names; a pod nothing owns goes by its own name. A pod's
+  own name works too, and so does a verification's job, as `status` names it.
+  A portal-api older than that lists pods without their owners, and zae reads
+  the names Kubernetes gives them instead — `<name>-<template hash>-<suffix>`
+  for a Deployment's, `<name>-<suffix>` for a Job's or a DaemonSet's,
+  `<name>-<ordinal>` for a StatefulSet's — with the generated parts in
+  Kubernetes' own alphabet, which keeps `chino-api` from claiming
+  `chino-api-worker`'s pods. What a name cannot tell is a Job generated from
+  a workload's name: by its pods' names, `api-bcdfg` reads as the Deployment
+  `api`.
 - **`--follow` reads again every two seconds,** as the console's live view
-  does: each read asks for the window since the last one, widened by five
-  seconds, and prints only the lines newer than the newest it printed — told
-  apart by the cluster's nanosecond timestamps. It lists the pods again every
-  round, so a rollout's new pods are read from their first line and the
-  retired ones are said to be gone. A failure that passes is said once; a
-  refused bearer ends it with `5`; Ctrl-C with `130`.
+  does: each read asks for the lines from the newest one printed on
+  (`sinceTime`, that line's own stamp, on the cluster's clock), and prints
+  only the lines newer than it — told apart by the cluster's nanosecond
+  timestamps, because the cluster reads `sinceTime` to the second and answers
+  the whole second again. A container that has printed nothing yet is read by
+  window — the seconds since the last read, widened by five, on this
+  machine's clock — and so is every container against a portal-api that
+  ignores `sinceTime` or refuses it, after one note saying so. It lists the
+  pods again every round, so a rollout's new pods are read from their first
+  line and the retired ones are said to be gone — once, whether a read or the
+  listing finds out first; a StatefulSet's pod back under its own name is read
+  again. A failure that passes is said once; a refused bearer ends it with
+  `5`; Ctrl-C with `130`.
 - **The bundle is never written over a file,** and the portal takes up to a
   minute to assemble it, which zae waits out.
+- **A read answers what is wrong with it.** A pod that went after zae listed
+  it is the portal's 404, a read the cluster refuses as asked its 400, in the
+  cluster's words. A pod asked for by its own name and gone is `3`, naming the
+  workload whose pods run in its place; one pod of a workload gone is a note,
+  and the others are printed; every pod of a workload gone by the time it is
+  read is `4` — its pods are being replaced, which says nothing about whether
+  it runs. A container the pod no longer runs is `3`, one still waiting to
+  start `1`. Neither ends a `--follow`.
 - Exit codes: `3` for what is not there, saying what is — no such workload,
-  container or topic, no event bus, no pods outside a cluster; `5` without the
-  admin role; `4` when the instance cannot be reached; `1` when a container
-  cannot be read, after printing the ones that could.
+  pod, container or topic, no event bus, no pods outside a cluster; `5`
+  without the admin role; `4` when the instance cannot be reached; `1` when a
+  container cannot be read, after printing the ones that could.
 
 ## Signing in — `zae login`
 
@@ -514,7 +616,7 @@ string concatenation, because a realm may be served under a path prefix.
 |---|---|
 | `zae login --url …` | signs in and stores the session. `--no-browser` prints the URL instead of opening one; `--issuer` and `--client-id` sign in to an instance that does not advertise them; `--scope` overrides the requested scopes |
 | `zae logout --url …` | ends that instance's session at its identity provider, then forgets it; `--all` does so for every one and removes the file |
-| `zae whoami --url …` | who the instance says the bearer is: username, roles, and whether it grants the bearer its admin role (`--role R` adds whether it lists R); `--json`. It never prints the token |
+| `zae whoami --url …` | who the instance says the bearer is: its subject, username, roles, whether it grants the bearer its admin role (`--role R` adds whether it lists R), and when it stops taking it; `--json`. It never prints the token |
 
 **Where credentials live.** `~/.config/zae/credentials.json`
 (`$XDG_CONFIG_HOME/zae/credentials.json` when that is set), mode `0600` in a
@@ -550,9 +652,13 @@ later.
 a portal may take it only on tokens issued to its own clients. `whoami` and
 `login` therefore ask (`GET /api/portal/me`) instead of reading a role name
 out of the token — a token can carry the role and still be refused, and
-whoami says why. Against a portal-api that cannot say, they read the token as
-before and say that they did; an instance that cannot be asked is exit `4`,
-one that refuses the bearer `5`.
+whoami says why. The answer also names the token's subject and when the
+instance stops taking it, which is all an opaque token has to go by; an
+instance with its authentication switched off says that no token stands behind
+the caller, and whoami shows no expiry rather than the token's own. Against a
+portal-api that cannot say, they read the token as before and say that they
+did; an instance that cannot be asked is exit `4`, one that refuses the bearer
+`5`.
 
 **Tokens are never printed.** Not by `login`, not by `whoami`, not in an error
 message — the one rule that keeps them out of scrollback, CI logs and pasted
@@ -609,11 +715,12 @@ still wins, for service accounts and CI.
 | Instance-side capability discovery (`/api/portal/cli/discovery`) | ✅ served by portal-api; acquire is the first service declaring itself (10 commands) |
 | Running discovered commands, with the exit-code contract and `zae require` | ✅ v0.2 |
 | `zae addon add/list/status/upgrade/remove` (charts installed by the operator) | 🔶 built against the addon chart API; needs an instance whose portal-api and operator ship it |
-| Addons added by their address: `zae addon add http://…`, `refresh`, and them in `list`/`status`/`remove` | ✅ `list` and `status` run against a live instance; the writes are built against the portal's address-addon API (`POST`/`DELETE /api/portal/addons`) |
+| Addons added by their address: `zae addon add http://…`, `refresh`, and them in `list`/`status`/`remove` | ✅ `list` and `status` (by `GET /api/portal/addons/{key}`) run against a live instance; the writes are built against the portal's address-addon API (`POST`/`DELETE /api/portal/addons`) |
 | `zae platform status/controller/update/restart/scale` (the operator console) | 🔶 built against the portal's operator console; needs an operator-managed instance — an older portal-api works, with a weaker `--wait` that says so. `controller` shows what is in charge and names where it is updated; updating it is out of scope by design |
 | `zae platform` in direct mode (no operator resource) | 🔶 built against the portal's operator console, as the console behaves without an operator |
-| `zae login` / `logout` / `whoami` (device grant with PKCE, refresh, per-instance sessions) | 🔶 built; needs a portal-api that advertises `auth` and an operator-created public client. `whoami` asking the instance runs against a live one; `logout` revoking at the issuer (RFC 7009) is built against the issuer's metadata |
-| `zae debug logs` / `events` / `bundle` (the portal's debug console) | ✅ `logs` (with `--follow`) and `events` run against a live instance; `bundle` is built against the portal's support bundle |
+| `zae login` / `logout` / `whoami` (device grant with PKCE, refresh, per-instance sessions) | 🔶 built; needs a portal-api that advertises `auth` and an operator-created public client. `whoami` asking the instance — its subject and expiry too — runs against a live one; `logout` revoking at the issuer (RFC 7009) is built against the issuer's metadata |
+| `zae debug logs` / `events` / `bundle` (the portal's debug console) | ✅ `logs` — pods by their owner, `--follow` by `sinceTime` — and `events` run against a live instance; `bundle` is built against the portal's support bundle |
+| `zae setup` (the first-run checklist) | 🔶 the checklist runs against a live instance; `metadata`, `scan`, `pipeline`, `done` and `reopen` are built against the portal's setup API and the operator console's pipeline switch |
 | Registered checks, `events tail`, journey smoke tests, `addon lint` | 🧭 next — discovery and login are in place |
 
 The platform-side design lives in the zaentrum docs:

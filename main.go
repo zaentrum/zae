@@ -62,6 +62,7 @@ Usage:
   zae platform update|restart|scale …              drive platform updates ('zae platform help')
   zae platform verify --url https://… [--wait]     ask the platform to verify itself now
   zae setup --url https://…                        the first-run checklist: each step, and what to do next
+  zae setup metadata|scan|pipeline|done|reopen …   work through it ('zae setup help')
   zae debug logs <workload> --url https://… [--follow] [--since 10m]
                                                    a workload's container logs, redacted
   zae debug events|bundle …                        the event tap, the support bundle ('zae debug help')
