@@ -3,6 +3,7 @@ package setup
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,7 @@ import (
 	"github.com/zaentrum/zae/internal/creds"
 	"github.com/zaentrum/zae/internal/exitcode"
 	"github.com/zaentrum/zae/internal/instance"
+	"github.com/zaentrum/zae/internal/term"
 )
 
 // clock is the moment every test reads "3 min ago" against.
@@ -36,8 +38,30 @@ type fakePortal struct {
 	old bool
 	// answer, when set, is sent for GET /setup instead of the document.
 	answer string
+	// catalog is how the catalog manager behind the portal takes a write:
+	// "" it does, "none" there is none configured, "silent" it does not
+	// answer, "refused" it refuses this admin, "failed" it answers an error.
+	catalog string
+	// echo is a portal that repeats the key it was sent — "refusal" in a
+	// 400, "answer" in the step's state and note of its answer — which
+	// portal-api never does, and zae must not rely on.
+	echo string
+	// key is the TMDB key the portal was sent, as it stores it.
+	key string
 
 	doc Doc
+}
+
+// catalogAnswers are what portal-api answers for a write the catalog manager
+// does not take, word for word.
+var catalogAnswers = map[string]struct {
+	status int
+	body   string
+}{
+	"none":    {http.StatusServiceUnavailable, "portal-api is pointed at no catalog manager (PORTAL_KATALOG_MANAGER_URL)"},
+	"silent":  {http.StatusBadGateway, "the catalog manager did not answer: dial tcp 10.0.0.7:8080: i/o timeout"},
+	"refused": {http.StatusBadGateway, "the catalog manager refused this admin: forbidden: settings requires the catalog-admin role"},
+	"failed":  {http.StatusBadGateway, "the catalog manager answered: setting tmdb.api_key: database is read-only"},
 }
 
 func newPortal(t *testing.T, doc Doc) (*fakePortal, *httptest.Server) {
@@ -50,6 +74,7 @@ func newPortal(t *testing.T, doc Doc) (*fakePortal, *httptest.Server) {
 		}
 		writeJSON(w, http.StatusOK, p.doc)
 	})
+	mux.HandleFunc("POST "+metadataPath, p.setKey)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		p.mu.Lock()
@@ -71,6 +96,45 @@ func newPortal(t *testing.T, doc Doc) (*fakePortal, *httptest.Server) {
 	}))
 	t.Cleanup(srv.Close)
 	return p, srv
+}
+
+// setKey is POST /setup/metadata {"tmdbKey"}, with portal-api's rules: an
+// unknown field refused, the key trimmed and refused when it is empty, too
+// long or holds whitespace — and handed to the catalog manager, which may not
+// take it.
+func (p *fakePortal) setKey(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		TMDBKey string `json:"tmdbKey"`
+	}
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	key := strings.TrimSpace(body.TMDBKey)
+	switch {
+	case p.echo == "refusal":
+		http.Error(w, "tmdbKey "+key+" is not one this portal takes", http.StatusBadRequest)
+		return
+	case key == "":
+		http.Error(w, "tmdbKey is empty — paste the API read access token from your TMDB account's API settings", http.StatusBadRequest)
+		return
+	case len(key) > 4096 || strings.ContainsAny(key, " \t\r\n"):
+		http.Error(w, "tmdbKey is no TMDB token", http.StatusBadRequest)
+		return
+	}
+	if a, ok := catalogAnswers[p.catalog]; ok {
+		http.Error(w, a.body, a.status)
+		return
+	}
+	p.key = key
+	at := clock
+	p.doc.Metadata = Metadata{Step: Step{State: stateDone}, Key: "setting", UpdatedAt: &at}
+	if p.echo == "answer" {
+		p.doc.Metadata = Metadata{Step: Step{State: "set to " + key, Note: "now " + key}, Key: key}
+	}
+	writeJSON(w, http.StatusOK, p.doc)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -161,14 +225,40 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// run executes `zae setup …` against the fixed clock.
+// run executes `zae setup …` against the fixed clock, with nothing on stdin
+// and no terminal.
 func run(t *testing.T, args ...string) (code int, out, errs string) {
 	t.Helper()
+	return runWith(t, "", false, args...)
+}
+
+// prompts are the prompts readHidden was asked to show, in order.
+var prompts []string
+
+// runWith executes `zae setup …` with input on stdin, which is a terminal or
+// not. On a terminal, a hidden prompt reads its line from that input, as the
+// question after it does.
+func runWith(t *testing.T, input string, terminal bool, args ...string) (code int, out, errs string) {
+	t.Helper()
 	var ob, eb bytes.Buffer
-	stdout, stderr = &ob, &eb
+	stdout, stderr, stdin = &ob, &eb, strings.NewReader(input)
+	canAsk = func() bool { return terminal }
 	now = func() time.Time { return clock }
+	prompts = nil
+	realHidden := readHidden
+	readHidden = func(prompt string) (string, error) {
+		prompts = append(prompts, prompt)
+		fmt.Fprint(stderr, prompt)
+		line, err := lineReader().ReadString('\n')
+		if err != nil && line == "" {
+			return "", err
+		}
+		return strings.TrimRight(line, "\r\n"), nil
+	}
 	defer func() {
-		stdout, stderr, now = os.Stdout, os.Stderr, time.Now
+		stdout, stderr, stdin, now = os.Stdout, os.Stderr, os.Stdin, time.Now
+		canAsk = func() bool { return term.Is(os.Stdin) }
+		readHidden = realHidden
 	}()
 	return Run(args), ob.String(), eb.String()
 }

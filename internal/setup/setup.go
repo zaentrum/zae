@@ -20,6 +20,7 @@
 package setup
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -27,16 +28,21 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/zaentrum/zae/internal/exitcode"
 	"github.com/zaentrum/zae/internal/instance"
+	"github.com/zaentrum/zae/internal/term"
 )
 
 // Streams and clocks are variables so tests can drive the commands.
 var (
 	stdout io.Writer = os.Stdout
 	stderr io.Writer = os.Stderr
+	stdin  io.Reader = os.Stdin
+	// canAsk: stdin is a terminal a person can answer on.
+	canAsk = func() bool { return term.Is(os.Stdin) }
 	// now is the clock "3 min ago" is read against.
 	now = time.Now
 )
@@ -46,6 +52,7 @@ func usage(w io.Writer) {
 
 Usage:
   zae setup --url https://… [--json]
+  zae setup metadata --url https://… --tmdb-key-file FILE|--tmdb-key-stdin [--yes]
 
 The checklist is what the launchpad shows an admin until one marks setup
 done: metadata (a TMDB key), library (the titles, where files go, the latest
@@ -54,10 +61,19 @@ phones and TVs sign in over) and people (accounts, which nothing here checks).
 The portal reads each step live from where it is configured; zae prints each
 one's state and what to do next. --json prints the portal's own document.
 
+metadata sets the catalog's TMDB key: TMDB's API read access token (v4, it
+starts with eyJ). It is read from a file, or from stdin — asked for without
+echo on a terminal — and never taken as an argument, where it would land in
+shell history; zae never prints it. It prints what changes and asks first;
+--yes skips the question, and without a terminal on stdin it is required —
+without it zae exits 2 before anything is written.
+
 Needs the platform's admin role: sign in with 'zae login --url …', or carry a
 bearer in ZAE_TOKEN (which wins when it is set).
-Exit codes: 0 read · 2 usage · 3 not offered (a portal-api without the
-checklist) · 4 undetermined · 5 forbidden.
+Exit codes: 0 done · 1 the instance refused it, or the change was declined · 2
+usage, a key that cannot be one included · 3 not offered (a portal-api without
+the checklist, no catalog manager) · 4 undetermined · 5 forbidden, the catalog
+manager refusing the admin included · 130/143 interrupted.
 `)
 }
 
@@ -87,6 +103,8 @@ func Run(args []string) int {
 		return exitcode.Usage
 	}
 	switch args[0] {
+	case "metadata":
+		return metadata(args[1:])
 	case "help", "--help", "-h":
 		usage(stdout)
 		return exitcode.OK
@@ -94,9 +112,12 @@ func Run(args []string) int {
 	if strings.HasPrefix(args[0], "-") {
 		return checklist(args)
 	}
-	errf("usage: zae setup has no command %q — the checklist is zae setup --url …", args[0])
+	errf("usage: zae setup has no command %q — the checklist is zae setup --url …; its writes are %s", args[0], writes)
 	return exitcode.Usage
 }
+
+// writes names the commands that work through the checklist.
+const writes = "metadata"
 
 // checklist prints every step of the checklist, its state and what to do
 // next.
@@ -157,6 +178,56 @@ func parse(fs *flag.FlagSet, args []string) (pos []string, code int, ok bool) {
 		pos = append(pos, rest[0])
 		args = rest[1:]
 	}
+}
+
+// setFlags names the flags actually given.
+func setFlags(fs *flag.FlagSet) map[string]bool {
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	return set
+}
+
+// requireTTY refuses, as usage and before anything is read or written, an
+// invocation that would ask on a stdin nobody can answer.
+func requireTTY(yes bool, doing string) int {
+	if !yes && !canAsk() {
+		return usageErr("stdin is not a terminal, so zae will not ask before %s — add --yes", doing)
+	}
+	return exitcode.OK
+}
+
+// One buffered reader serves every line read from stdin — a key typed at the
+// prompt and the answer to the question after it — so a line typed ahead is
+// not lost between the two.
+var (
+	linesMu   sync.Mutex
+	linesFrom io.Reader
+	lines     *bufio.Reader
+)
+
+func lineReader() *bufio.Reader {
+	linesMu.Lock()
+	defer linesMu.Unlock()
+	if lines == nil || linesFrom != stdin {
+		linesFrom, lines = stdin, bufio.NewReader(stdin)
+	}
+	return lines
+}
+
+// confirm asks on stdin. Anything but y or yes is no — an empty line and a
+// closed stdin included — so a stray Enter never changes the platform.
+func confirm(question string) bool {
+	fmt.Fprintf(stdout, "%s [y/N] ", question)
+	line, err := lineReader().ReadString('\n')
+	if err != nil && line == "" {
+		fmt.Fprintln(stdout)
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return true
+	}
+	return false
 }
 
 // baseOf validates --url, as usage.
