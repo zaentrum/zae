@@ -2,7 +2,8 @@ name: image
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+    # A release: the tag vX.Y.Z publishes the image as :vX.Y.Z and :X.Y.
+    tags: ['v*.*.*']
   workflow_dispatch: {}
 permissions:
   contents: read
@@ -18,12 +19,20 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # main publishes :latest. A release tag publishes :vX.Y.Z and :X.Y (no
+      # :X.Y for a pre-release such as v1.2.0-rc.1), and leaves :latest where
+      # main put it: a release build that finishes after a newer push to main,
+      # or a tag on an older commit, must not move everyone back.
       - id: meta
         run: |
-          ref="${GITHUB_REF_NAME}"
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            echo "tags=ghcr.io/zaentrum/zae:latest,ghcr.io/zaentrum/zae:${ref}" >> "$GITHUB_OUTPUT"
-            echo "version=${ref}" >> "$GITHUB_OUTPUT"
+            tags="ghcr.io/zaentrum/zae:${GITHUB_REF_NAME}"
+            case "${GITHUB_REF_NAME}" in
+              *-*) ;;
+              *) v="${GITHUB_REF_NAME#v}"; tags="${tags},ghcr.io/zaentrum/zae:${v%.*}" ;;
+            esac
+            echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           else
             echo "tags=ghcr.io/zaentrum/zae:latest" >> "$GITHUB_OUTPUT"
             echo "version=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
