@@ -6,7 +6,8 @@
 //     speak for itself: preflight and outside-in diagnosis (doctor, which
 //     with --sign-in also uses the platform the way a person does — the check
 //     the platform runs on itself after every update), signing in (login),
-//     adding addons (addon), reading the platform's logs (debug). These ship
+//     adding addons (addon), reading the platform's logs (debug), working
+//     through a fresh platform's first-run checklist (setup). These ship
 //     in the binary because a service can only extend the CLI once it is
 //     running, and the moments you need doctor most are the moments nothing
 //     is. An addon cannot declare the command that installs it.
@@ -34,6 +35,7 @@ import (
 	"github.com/zaentrum/zae/internal/exitcode"
 	"github.com/zaentrum/zae/internal/invoke"
 	"github.com/zaentrum/zae/internal/platform"
+	"github.com/zaentrum/zae/internal/setup"
 )
 
 // version is stamped by the release build (-ldflags "-X main.version=v…").
@@ -59,6 +61,7 @@ Usage:
   zae platform controller --url https://…          the operator's own controller, and what updates it
   zae platform update|restart|scale …              drive platform updates ('zae platform help')
   zae platform verify --url https://… [--wait]     ask the platform to verify itself now
+  zae setup --url https://…                        the first-run checklist: each step, and what to do next
   zae debug logs <workload> --url https://… [--follow] [--since 10m]
                                                    a workload's container logs, redacted
   zae debug events|bundle …                        the event tap, the support bundle ('zae debug help')
@@ -113,6 +116,10 @@ func main() {
 		// Static like doctor: a platform's logs are read when something is
 		// wrong with it, which is when it may not be able to declare anything.
 		os.Exit(debug.Run(os.Args[2:], version))
+	case "setup":
+		// Static like platform: first-run setup is what a platform needs
+		// before anything is installed on it that could declare a command.
+		os.Exit(setup.Run(os.Args[2:]))
 	case "help", "--help", "-h":
 		usage()
 	default:
