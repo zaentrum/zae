@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/zaentrum/zae/internal/instance"
@@ -24,12 +25,49 @@ const mePath = "/api/portal/me"
 // IsAdmin is a pointer: a portal-api that answers without it is older than
 // the answer, and the token is read instead. AdminRole and Client are newer
 // still, and may be empty.
+//
+// Subject and ExpiresAt are newest: the token's sub as the instance verified
+// it — the one name an opaque token has — and when the instance stops taking
+// the bearer. ExpiresAt is kept raw, because its three shapes mean three
+// things: absent (a portal-api older than it), null (no token stands behind
+// the caller: the instance's authentication is switched off), or a time.
 type me struct {
-	Username  string   `json:"username"`
-	Roles     []string `json:"roles"`
-	IsAdmin   *bool    `json:"isAdmin"`
-	AdminRole string   `json:"adminRole"`
-	Client    string   `json:"client"`
+	Username  string          `json:"username"`
+	Roles     []string        `json:"roles"`
+	IsAdmin   *bool           `json:"isAdmin"`
+	AdminRole string          `json:"adminRole"`
+	Client    string          `json:"client"`
+	Subject   string          `json:"subject"`
+	ExpiresAt json.RawMessage `json:"expiresAt"`
+}
+
+// expiry is when the instance stops taking the bearer, as it answered. said
+// is false when it did not say — an older portal-api, or a value zae cannot
+// read — and the token's own expiry is all there is. A zero time that was said
+// is a caller no token stands behind.
+func (m *me) expiry() (at time.Time, said bool) {
+	switch raw := strings.TrimSpace(string(m.ExpiresAt)); raw {
+	case "":
+		return time.Time{}, false
+	case "null":
+		return time.Time{}, true
+	}
+	var s string
+	if json.Unmarshal(m.ExpiresAt, &s) != nil {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+// noToken reports whether the instance said that no token stands behind this
+// caller, so no expiry applies.
+func (m *me) noToken() bool {
+	at, said := m.expiry()
+	return said && at.IsZero()
 }
 
 // meOutcome is how asking went.

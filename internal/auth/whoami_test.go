@@ -1,12 +1,15 @@
 package auth
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zaentrum/zae/internal/capability"
 	"github.com/zaentrum/zae/internal/exitcode"
@@ -175,6 +178,106 @@ func TestWhoamiRefusedAndUnreachable(t *testing.T) {
 	if code != exitcode.Undetermined || json.Unmarshal([]byte(out), &doc) != nil || doc.From != "token" || doc.AdminRole != instance.AdminRole {
 		t.Fatalf("unreachable --json: %d %q", code, out)
 	}
+}
+
+// The instance verified the token, so it says whose it is and until when it
+// takes it — the only names an opaque token has. Its answer is what whoami
+// prints, over anything the token claims.
+func TestWhoamiShowsTheSubjectAndExpiryTheInstanceAnswers(t *testing.T) {
+	setup(t)
+	in := newInstanceWithMe(t, nil,
+		`{"username":"svc","subject":"8b1f2c3d-service","roles":["zaentrum-admin"],"isAdmin":true,"adminRole":"zaentrum-admin","client":"zae","expiresAt":"2030-01-02T03:04:05Z"}`)
+	t.Setenv(instance.TokenEnv, "an-opaque-service-token")
+	code, out, errs := run(t, func() int { return Whoami([]string{"--url", in.srv.URL}) })
+	if code != exitcode.OK {
+		t.Fatalf("want 0, got %d\n%s\n%s", code, out, errs)
+	}
+	until := time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)
+	for _, s := range []string{
+		"subject     8b1f2c3d-service",
+		"username    svc",
+		"expires     " + until.Local().Format(time.RFC1123),
+	} {
+		if !strings.Contains(out, s) {
+			t.Errorf("whoami lacks %q:\n%s", s, out)
+		}
+	}
+	if strings.Contains(out, "an-opaque-service-token") {
+		t.Fatal("whoami printed the token")
+	}
+	code, out, _ = run(t, func() int { return Whoami([]string{"--url", in.srv.URL, "--json"}) })
+	var doc whoamiDoc
+	if code != exitcode.OK || json.Unmarshal([]byte(out), &doc) != nil {
+		t.Fatalf("--json: %d %q", code, out)
+	}
+	if doc.Subject != "8b1f2c3d-service" || doc.Expires != "2030-01-02T03:04:05Z" || doc.From != "instance" {
+		t.Fatalf("--json carries what the instance answered: %+v", doc)
+	}
+
+	// A token zae can read says the same things of itself; the instance's
+	// answer still wins, since the instance is what takes or refuses it.
+	setup(t)
+	p := newIDP(t, granted(instance.AdminRole))
+	in2 := newInstanceWithMe(t, &capability.Auth{Issuer: p.issuer(), ClientID: "zae"},
+		`{"username":"ada","subject":"verified-sub","roles":[],"isAdmin":true,"adminRole":"zaentrum-admin","client":"zae","expiresAt":"2030-01-02T03:04:05Z"}`)
+	if code, _, errs := run(t, func() int { return Login([]string{"--url", in2.srv.URL, "--no-browser"}) }); code != exitcode.OK {
+		t.Fatalf("setup login failed: %d %s", code, errs)
+	}
+	_, out, _ = run(t, func() int { return Whoami([]string{"--url", in2.srv.URL}) })
+	if !strings.Contains(out, "subject     verified-sub") || !strings.Contains(out, "expires     "+until.Local().Format(time.RFC1123)) {
+		t.Errorf("the instance's subject and expiry win over the token's claims:\n%s", out)
+	}
+	noSecrets(t, "whoami", out)
+}
+
+// An instance without authentication takes a caller with no token behind it:
+// it says so with a null expiry, and no expiry of the token's is shown as if
+// it counted there.
+func TestWhoamiOnAnInstanceThatTakesNoToken(t *testing.T) {
+	setup(t)
+	in := newInstanceWithMe(t, nil,
+		`{"username":"","subject":"anonymous","roles":[],"isAdmin":true,"adminRole":"zaentrum-admin","client":"","expiresAt":null}`)
+	t.Setenv(instance.TokenEnv, "eyJhbGciOiJSUzI1NiJ9."+jwtPayload(t, map[string]any{"sub": "user-1", "exp": time.Now().Add(time.Hour).Unix()})+".sig")
+	code, out, errs := run(t, func() int { return Whoami([]string{"--url", in.srv.URL}) })
+	if code != exitcode.OK {
+		t.Fatalf("want 0, got %d\n%s\n%s", code, out, errs)
+	}
+	if !strings.Contains(out, "subject     anonymous") || !strings.Contains(out, "authentication is switched off") {
+		t.Errorf("whoami must say the instance takes no token:\n%s", out)
+	}
+	if regexp.MustCompile(`expires     [A-Z][a-z]{2}, `).MatchString(out) {
+		t.Errorf("the token's own expiry does not count here:\n%s", out)
+	}
+	_, out, _ = run(t, func() int { return Whoami([]string{"--url", in.srv.URL, "--json"}) })
+	var doc whoamiDoc
+	if json.Unmarshal([]byte(out), &doc) != nil || doc.Expires != "" || doc.Subject != "anonymous" {
+		t.Errorf("--json: no expiry, the instance's subject: %q", out)
+	}
+}
+
+// A portal-api older than the subject and the expiry answers neither: they
+// come from the token, as before.
+func TestWhoamiTakesTheSubjectAndExpiryFromTheTokenOnAnOlderPortal(t *testing.T) {
+	setup(t)
+	p := newIDP(t, granted(instance.AdminRole))
+	in := newInstanceWithMe(t, &capability.Auth{Issuer: p.issuer(), ClientID: "zae"},
+		`{"username":"ada","roles":["zaentrum-admin"],"isAdmin":true,"adminRole":"zaentrum-admin","client":"zae"}`)
+	if code, _, errs := run(t, func() int { return Login([]string{"--url", in.srv.URL, "--no-browser"}) }); code != exitcode.OK {
+		t.Fatalf("setup login failed: %d %s", code, errs)
+	}
+	_, out, _ := run(t, func() int { return Whoami([]string{"--url", in.srv.URL}) })
+	if !strings.Contains(out, "subject     user-1") || !regexp.MustCompile(`expires     [A-Z][a-z]{2}, `).MatchString(out) {
+		t.Errorf("the token's subject and expiry, from an older portal:\n%s", out)
+	}
+}
+
+func jwtPayload(t *testing.T, claims map[string]any) string {
+	t.Helper()
+	b, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
 }
 
 // login asks the same question, with the token it was just given — not with

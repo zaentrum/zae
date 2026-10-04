@@ -453,9 +453,11 @@ func endSession(ctx context.Context, base string, e creds.Entry) int {
 //
 // It ASKS (GET /api/portal/me): which role makes an admin is the instance's
 // setting, and a portal may take that role only on tokens issued to its own
-// clients — neither is in the token. Against a portal-api older than the
-// answer, and when the instance cannot be reached, it reads the token's own
-// claims as before and says that it did. It never prints the token.
+// clients — neither is in the token. The instance also says whose the token is
+// (its subject) and until when it takes it, which is all an opaque token
+// offers. Against a portal-api older than the answer, and when the instance
+// cannot be reached, it reads the token's own claims as before and says that
+// it did. It never prints the token.
 //
 // Exit codes: 0 answered (or read from the token, from an older portal), 4
 // the instance could not be asked, 5 no credentials, or the instance refused
@@ -546,9 +548,15 @@ func (w *whoami) source() string {
 	return "the stored session"
 }
 
-// expiry is when the bearer stops working: the token's own exp, else what the
-// identity provider said when it issued the stored one.
+// expiry is when the bearer stops working: when the instance says it stops
+// taking it, else the token's own exp, else what the identity provider said
+// when it issued the stored one.
 func (w *whoami) expiry() time.Time {
+	if w.me != nil {
+		if at, said := w.me.expiry(); said && !at.IsZero() {
+			return at
+		}
+	}
 	if w.jwt && !w.claims.Expiry.IsZero() {
 		return w.claims.Expiry
 	}
@@ -568,8 +576,8 @@ func (w *whoami) print(how meOutcome) {
 	} else if w.me != nil && w.me.Client != "" {
 		fmt.Fprintf(stdout, "  client      %s\n", w.me.Client)
 	}
-	if w.jwt {
-		fmt.Fprintf(stdout, "  subject     %s\n", orUnset(w.claims.Subject))
+	if s, ok := w.subject(); ok {
+		fmt.Fprintf(stdout, "  subject     %s\n", orUnset(s))
 	}
 	switch {
 	case w.me != nil:
@@ -592,9 +600,28 @@ func (w *whoami) print(how meOutcome) {
 		fmt.Fprintf(stdout, "  username    %s\n", orUnset(w.claims.Username))
 		fmt.Fprintf(stdout, "  admin role  %s\n", roleStateFor(w.claims, w.role))
 	}
+	if w.me != nil && w.me.noToken() {
+		// What the token says about its own expiry is beside the point: this
+		// instance takes the caller without one.
+		fmt.Fprintln(stdout, "  expires     - (the instance takes this caller without a token: its authentication is switched off)")
+		return
+	}
 	if exp := w.expiry(); !exp.IsZero() {
 		fmt.Fprintf(stdout, "  expires     %s%s\n", exp.Local().Format(time.RFC1123), expiryNote(exp, !w.env && w.entry.RefreshToken != ""))
 	}
+}
+
+// subject is whose the bearer is: the instance's answer, which names an
+// opaque token too, else the token's own claim. ok is false when neither can
+// say.
+func (w *whoami) subject() (string, bool) {
+	if w.me != nil && w.me.Subject != "" {
+		return w.me.Subject, true
+	}
+	if w.jwt {
+		return w.claims.Subject, true
+	}
+	return "", false
 }
 
 // listed says whether the instance lists a role for this bearer.
@@ -630,9 +657,7 @@ func (w *whoami) printJSON() {
 	} else {
 		d.Issuer, d.ClientID = w.entry.Issuer, w.entry.ClientID
 	}
-	if w.jwt {
-		d.Subject = w.claims.Subject
-	}
+	d.Subject, _ = w.subject()
 	switch {
 	case w.me != nil:
 		d.From, d.Username, d.Admin, d.AdminRole = "instance", w.me.Username, *w.me.IsAdmin, w.me.AdminRole
@@ -650,7 +675,7 @@ func (w *whoami) printJSON() {
 	default:
 		d.From = "nothing"
 	}
-	if exp := w.expiry(); !exp.IsZero() {
+	if exp := w.expiry(); !exp.IsZero() && (w.me == nil || !w.me.noToken()) {
 		d.Expires = exp.UTC().Format(time.RFC3339)
 	}
 	b, _ := json.Marshal(d)
