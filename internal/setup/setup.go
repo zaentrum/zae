@@ -54,6 +54,7 @@ Usage:
   zae setup --url https://… [--json]
   zae setup metadata --url https://… --tmdb-key-file FILE|--tmdb-key-stdin [--yes]
   zae setup scan --url https://…
+  zae setup pipeline on|off --url https://… [--yes]
   zae setup done --url https://… [--yes]
   zae setup reopen --url https://…
 
@@ -68,20 +69,23 @@ metadata sets the catalog's TMDB key: TMDB's API read access token (v4, it
 starts with eyJ). It is read from a file, or from stdin — asked for without
 echo on a terminal — and never taken as an argument, where it would land in
 shell history; zae never prints it. scan starts a scan of the library, unless
-one is under way. done marks setup done, so the launchpad stops showing the
-checklist; reopen shows it again.
+one is under way. pipeline switches the media pipeline — analyzer,
+katalog-ingest, packager, transcoder — on the operator's resource. done marks
+setup done, so the launchpad stops showing the checklist; reopen shows it
+again.
 
-metadata prints what changes and asks first, and so does done while steps
-are open. --yes skips the question; without a terminal on stdin it is
-required, and without it zae exits 2 before anything is written. scan and
-reopen do not ask, as the console does not.
+metadata and pipeline print what changes and ask first, and so does done
+while steps are open. --yes skips the question; without a terminal on stdin
+it is required, and without it zae exits 2 before anything is written. scan
+and reopen do not ask, as the console does not.
 
 Needs the platform's admin role: sign in with 'zae login --url …', or carry a
 bearer in ZAE_TOKEN (which wins when it is set).
 Exit codes: 0 done · 1 the instance refused it, or the change was declined · 2
 usage, a key that cannot be one included · 3 not offered (a portal-api without
-the checklist, no catalog manager) · 4 undetermined · 5 forbidden, the catalog
-manager refusing the admin included · 130/143 interrupted.
+the checklist or the switch, no catalog manager, no operator's resource to
+switch the pipeline on) · 4 undetermined · 5 forbidden, the catalog manager
+refusing the admin included · 130/143 interrupted.
 `)
 }
 
@@ -115,6 +119,8 @@ func Run(args []string) int {
 		return metadata(args[1:])
 	case "scan":
 		return scan(args[1:])
+	case "pipeline":
+		return pipeline(args[1:])
 	case "done":
 		return done(args[1:])
 	case "reopen":
@@ -131,7 +137,7 @@ func Run(args []string) int {
 }
 
 // writes names the commands that work through the checklist.
-const writes = "metadata, scan, done and reopen"
+const writes = "metadata, scan, pipeline, done and reopen"
 
 // checklist prints every step of the checklist, its state and what to do
 // next.

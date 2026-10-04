@@ -49,6 +49,12 @@ type fakePortal struct {
 	echo string
 	// key is the TMDB key the portal was sent, as it stores it.
 	key string
+	// legacyOperator is a portal-api older than the pipeline switch: its
+	// PATCH /operator refuses the field as one it does not know.
+	legacyOperator bool
+	// outside is a portal-api that runs where it manages no workloads.
+	outside    bool
+	generation int64
 
 	doc Doc
 }
@@ -77,6 +83,7 @@ func newPortal(t *testing.T, doc Doc) (*fakePortal, *httptest.Server) {
 	})
 	mux.HandleFunc("POST "+metadataPath, p.setKey)
 	mux.HandleFunc("POST "+scanPath, p.scan)
+	mux.HandleFunc("PATCH "+operatorPath, p.patchOperator)
 	mux.HandleFunc("GET "+completePath, func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, completion{Completed: p.doc.Completed})
 	})
@@ -151,6 +158,60 @@ func (p *fakePortal) setKey(w http.ResponseWriter, r *http.Request) {
 		p.doc.Metadata = Metadata{Step: Step{State: "set to " + key, Note: "now " + key}, Key: key}
 	}
 	writeJSON(w, http.StatusOK, p.doc)
+}
+
+// patchOperator is the operator console's PATCH /operator, as far as the
+// pipeline goes: unknown fields refused — the pipeline itself, by a legacy
+// portal — and the switch written to the resource, answered with the
+// generation it made. The checklist then reads the pipeline as asked for and
+// its workers not rolled out yet.
+func (p *fakePortal) patchOperator(w http.ResponseWriter, r *http.Request) {
+	if p.outside {
+		http.Error(w, "instance management is unavailable (not running in a cluster)", http.StatusServiceUnavailable)
+		return
+	}
+	var body struct {
+		Version    *string `json:"version"`
+		Channel    *string `json:"channel"`
+		UpdateMode *string `json:"updateMode"`
+		Pipeline   *bool   `json:"pipeline"`
+	}
+	var legacy struct {
+		Version    *string `json:"version"`
+		Channel    *string `json:"channel"`
+		UpdateMode *string `json:"updateMode"`
+	}
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	var err error
+	if p.legacyOperator {
+		err = dec.Decode(&legacy)
+	} else {
+		err = dec.Decode(&body)
+	}
+	switch {
+	case err != nil:
+		http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
+		return
+	case !p.doc.Processing.Switchable:
+		http.Error(w, "no operator instance to configure", http.StatusBadRequest)
+		return
+	case body.Pipeline == nil:
+		http.Error(w, "nothing to change", http.StatusBadRequest)
+		return
+	}
+	on := *body.Pipeline
+	p.generation++
+	pr := &p.doc.Processing
+	pr.Pipeline, pr.Workers = &on, []Worker{}
+	pr.State = stateOptional
+	if on {
+		pr.State = stateWorking
+		for _, name := range []string{"analyzer", "katalog-ingest", "packager", "transcoder"} {
+			pr.Workers = append(pr.Workers, Worker{Name: name, Phase: "absent"})
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"version": "latest", "generation": p.generation})
 }
 
 // scan is POST /setup/library/scan: a body, when one is sent, must be empty;
