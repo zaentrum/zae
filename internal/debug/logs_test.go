@@ -137,11 +137,20 @@ func TestLogsOfWhatIsNotThere(t *testing.T) {
 	if code != exitcode.NotOffered {
 		t.Fatalf("an unknown workload: want 3, got %d %q", code, errs)
 	}
-	for _, s := range []string{`no workload named "katalog-api"`, "chino-api, chino-api-worker, chino-web, portal-api, postgres, zaentrum-verify"} {
+	// What runs, by the workloads the portal names: the verification's Job
+	// by its own name, as `zae platform status` shows it.
+	for _, s := range []string{`no workload named "katalog-api"`, "it runs chino-api, chino-api-worker, chino-web, portal-api, postgres, zaentrum-verify-fzzgp ("} {
 		if !strings.Contains(errs, s) {
 			t.Errorf("the message lacks %q: %q", s, errs)
 		}
 	}
+	// An older portal-api names no owners, and the names are read off the
+	// pods' — where a Job's generated suffix reads as a template hash.
+	p.legacy = true
+	if _, _, errs := run(t, "logs", "katalog-api", "--url", srv.URL); !strings.Contains(errs, "it runs chino-api, chino-api-worker, chino-web, portal-api, postgres, zaentrum-verify (") {
+		t.Errorf("an older portal-api: the names its pods say: %q", errs)
+	}
+	p.legacy = false
 	code, _, errs = run(t, "logs", "portal-api", "--container", "sidecar", "--url", srv.URL)
 	if code != exitcode.NotOffered || !strings.Contains(errs, `no container "sidecar"`) || !strings.Contains(errs, "its containers are app, proxy") {
 		t.Fatalf("an unknown container: want 3 naming the ones there, got %d %q", code, errs)
@@ -201,6 +210,50 @@ func TestMatchAndWorkloadNames(t *testing.T) {
 	}
 }
 
+// The portal names what runs each pod, and a workload's pods are found by
+// that — not by their names, which cannot tell a Job made from another
+// workload's name apart from that workload: api-bcdfg's pods read like the
+// Deployment api's. Live, the demo's migration Job postgres-migrate-b27zs reads
+// like a Deployment postgres-migrate by its pod's name.
+func TestLogsFindAWorkloadsPodsByTheOwnerThePortalNames(t *testing.T) {
+	p, srv := newPortal(t)
+	p.pods = []Pod{
+		owned("api-7d79fd4c4b-xprff", "Deployment", "api", "app"),
+		owned("api-bcdfg-qfmtj", "Job", "api-bcdfg", "job"),
+		owned("postgres-migrate-b27zs-l9pbg", "Job", "postgres-migrate-b27zs", "migrate"),
+		owned("debug-shell", "", "", "shell"),
+	}
+	p.logs = map[string][]string{
+		"api-7d79fd4c4b-xprff/app":             {line(1, "the api")},
+		"api-bcdfg-qfmtj/job":                  {line(2, "a job made from the api's name")},
+		"postgres-migrate-b27zs-l9pbg/migrate": {line(3, "migrated")},
+		"debug-shell/shell":                    {line(4, "a pod nothing owns")},
+	}
+	if code, out, errs := run(t, "logs", "api", "--url", srv.URL); code != exitcode.OK || out != line(1, "the api")+"\n" {
+		t.Errorf("api is its Deployment's pods, and only those: %d\n%s\n%s", code, out, errs)
+	}
+	if code, out, _ := run(t, "logs", "postgres-migrate-b27zs", "--url", srv.URL); code != exitcode.OK || out != line(3, "migrated")+"\n" {
+		t.Errorf("a Job, by its own name: %d\n%s", code, out)
+	}
+	code, _, errs := run(t, "logs", "postgres-migrate", "--url", srv.URL)
+	if code != exitcode.NotOffered || !strings.Contains(errs, "it runs api, api-bcdfg, debug-shell, postgres-migrate-b27zs (") {
+		t.Errorf("no workload of that name runs the Job's pod: want 3 naming what runs, got %d %q", code, errs)
+	}
+	if code, out, _ := run(t, "logs", "debug-shell", "--url", srv.URL); code != exitcode.OK || out != line(4, "a pod nothing owns")+"\n" {
+		t.Errorf("a pod nothing owns, by its own name: %d\n%s", code, out)
+	}
+
+	// The same namespace from an older portal-api: the names are all there
+	// is, and they are read as they always were.
+	p.legacy = true
+	if code, out, _ := run(t, "logs", "api", "--url", srv.URL); code != exitcode.OK || !strings.Contains(out, "[api-bcdfg-qfmtj/job] ") {
+		t.Errorf("an older portal-api: every pod named for api: %d\n%s", code, out)
+	}
+	if code, out, _ := run(t, "logs", "postgres-migrate", "--url", srv.URL); code != exitcode.OK || out != line(3, "migrated")+"\n" {
+		t.Errorf("an older portal-api: the pod named for postgres-migrate: %d\n%s", code, out)
+	}
+}
+
 // --follow reads every round, prints each line once, and takes up the pods a
 // rollout brings while it says which ones went.
 func TestFollowPrintsEachLineOnceThroughARollout(t *testing.T) {
@@ -213,7 +266,7 @@ func TestFollowPrintsEachLineOnceThroughARollout(t *testing.T) {
 			p.logs[a] = append(p.logs[a], line(5, "first replica, later"))
 		case 3:
 			// The rollout: one old replica is gone, its replacement is up.
-			p.pods = append([]Pod{{Pod: "chino-api-5f6d8c9b7d-wv2bn", Phase: "Running", Containers: []string{"app"}}}, p.pods[1:]...)
+			p.pods = append([]Pod{owned("chino-api-5f6d8c9b7d-wv2bn", "Deployment", "chino-api", "app")}, p.pods[1:]...)
 			p.logs["chino-api-5f6d8c9b7d-wv2bn/app"] = []string{line(6, "new replica starts")}
 		case 4:
 			k := "chino-api-5f6d8c9b7d-wv2bn/app"

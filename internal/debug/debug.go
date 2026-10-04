@@ -55,10 +55,10 @@ Usage:
   zae debug events --url https://… [--topic T] [--limit N] [--payload] [--json]
   zae debug bundle -o FILE|- --url https://… [--without logs,instances,kafka,registry,config,client]
 
-logs prints a workload's container logs: the pods Kubernetes names for a
-Deployment (or a StatefulSet, DaemonSet or Job) of that name — or one pod, by
-its own name — every container of each unless --container picks one, merged
-by time. With more than one, each line starts with [pod/container]. --tail is
+logs prints a workload's container logs: the pods the portal says a
+Deployment (or a StatefulSet, DaemonSet or Job) of that name runs — an older
+portal-api, the pods named for it — or one pod, by its own name; every
+container of each unless --container picks one, merged by time. With more than one, each line starts with [pod/container]. --tail is
 lines per container (the portal's default is 500, its most 5000); --since
 keeps only newer lines. --follow keeps reading until Ctrl-C, and takes up the
 pods a rollout replaces them with. --json prints one object per line.

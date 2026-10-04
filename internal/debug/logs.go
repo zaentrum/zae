@@ -17,11 +17,42 @@ import (
 )
 
 // Pod is one row of GET /api/portal/debug/pods: a pod of the platform's
-// namespace, its phase, and the names of its containers.
+// namespace, its phase, the names of its containers — and what runs it.
 type Pod struct {
 	Pod        string   `json:"pod"`
 	Phase      string   `json:"phase"`
 	Containers []string `json:"containers"`
+	// Workload is what runs the pod, read from its owner references: a
+	// Deployment (behind its ReplicaSet), a StatefulSet, a DaemonSet, a Job —
+	// WorkloadKind says which — and "" for a pod nothing owns. A pointer,
+	// because a portal-api older than the field sends no key at all, and the
+	// pod's name is then all zae has to go on.
+	Workload     *string `json:"workload,omitempty"`
+	WorkloadKind string  `json:"workloadKind,omitempty"`
+}
+
+// of reports whether the pod is one of the workload name's: the one the portal
+// says runs it, or — from a portal-api that does not say — the one its name
+// says, by the names Kubernetes gives a workload's pods.
+func (p Pod) of(name string) bool {
+	if p.Workload != nil {
+		return *p.Workload == name
+	}
+	rest, ok := strings.CutPrefix(p.Pod, name+"-")
+	return ok && generated(rest)
+}
+
+// workload is the name to read the pod's workload by: the one the portal
+// names, the pod's own when nothing owns it, and from an older portal-api the
+// one its name says.
+func (p Pod) workload() string {
+	switch {
+	case p.Workload == nil:
+		return workloadOf(p.Pod)
+	case *p.Workload == "":
+		return p.Pod
+	}
+	return *p.Workload
 }
 
 // source is one container whose log is read.
@@ -154,12 +185,15 @@ func listPods(ctx context.Context, c *client) ([]Pod, error) {
 // workload named name — and of each, every container or the one asked for.
 // exact is true when name is a pod's own.
 //
-// The portal lists pods without their owners, so a workload's pods are found
-// by the names Kubernetes gives them: <name>-<template hash>-<suffix> for a
-// Deployment's, <name>-<suffix> for a Job's or a DaemonSet's, <name>-<ordinal>
-// for a StatefulSet's. The generated parts are written in Kubernetes' own
-// alphabet, which keeps chino from claiming chino-web's pods: "web" is not a
-// template hash.
+// The portal names the workload that runs each pod, from its owner references,
+// and that is what a workload's pods are found by. A portal-api older than
+// that lists pods without their owners, and then they are found by the names
+// Kubernetes gives them: <name>-<template hash>-<suffix> for a Deployment's,
+// <name>-<suffix> for a Job's or a DaemonSet's, <name>-<ordinal> for a
+// StatefulSet's. The generated parts are written in Kubernetes' own alphabet,
+// which keeps chino from claiming chino-web's pods: "web" is not a template
+// hash. What a name cannot say is whether a Job named api-bcdfg was made from
+// api: by name its pods read as the Deployment api's — by owner they are not.
 func match(name, container string, pods []Pod) (srcs []source, exact bool) {
 	var chosen []Pod
 	for _, p := range pods {
@@ -170,7 +204,7 @@ func match(name, container string, pods []Pod) (srcs []source, exact bool) {
 	}
 	if !exact {
 		for _, p := range pods {
-			if rest, ok := strings.CutPrefix(p.Pod, name+"-"); ok && generated(rest) {
+			if p.of(name) {
 				chosen = append(chosen, p)
 			}
 		}
@@ -217,7 +251,8 @@ func ordinal(s string) bool {
 }
 
 // workloadOf is the workload a pod's name says it belongs to, or the pod's
-// own name when it carries no generated part.
+// own name when it carries no generated part — the guess an older portal-api
+// leaves zae with.
 func workloadOf(pod string) string {
 	for i := len(pod) - 1; i > 0; i-- {
 		if pod[i] == '-' && generated(pod[i+1:]) {
@@ -253,7 +288,7 @@ func noSuchSource(base, name, container string, pods []Pod) int {
 	}
 	var names []string
 	for _, p := range pods {
-		if n := workloadOf(p.Pod); !contains(names, n) {
+		if n := p.workload(); !contains(names, n) {
 			names = append(names, n)
 		}
 	}

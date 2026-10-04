@@ -31,7 +31,10 @@ type fakePortal struct {
 	calls []string
 	logQ  []url.Values // the query of every log read, in order
 
-	token  string // required bearer, "" for none
+	token string // required bearer, "" for none
+	// legacy is a portal-api from before the pods named the workload that
+	// runs them: it lists each pod without its owner.
+	legacy bool
 	pods   []Pod
 	logs   map[string][]string // pod/container → lines, timestamp first
 	broken map[string]string   // pod/container → a 500 the log read answers
@@ -55,7 +58,17 @@ func newPortal(t *testing.T) (*fakePortal, *httptest.Server) {
 		if p.onList != nil {
 			p.onList(p, p.lists)
 		}
-		writeJSON(w, p.pods)
+		if !p.legacy {
+			writeJSON(w, p.pods)
+			return
+		}
+		// Absent, not empty: an older portal-api has never heard of the field.
+		old := make([]Pod, 0, len(p.pods))
+		for _, pod := range p.pods {
+			pod.Workload, pod.WorkloadKind = nil, ""
+			old = append(old, pod)
+		}
+		writeJSON(w, old)
 	})
 	mux.HandleFunc("GET "+logsPath, p.log)
 	mux.HandleFunc("GET "+topologyPath, func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, p.topology) })
@@ -132,18 +145,26 @@ func at(s int) string {
 // line is a log line as the cluster stamps it.
 func line(s int, text string) string { return at(s) + " " + text }
 
+// owned is a pod as the portal lists it: with the workload that runs it, and
+// that workload's kind.
+func owned(pod, kind, workload string, containers ...string) Pod {
+	return Pod{Pod: pod, Phase: "Running", Containers: containers, Workload: &workload, WorkloadKind: kind}
+}
+
 // exampleNamespace is what the portal lists for a platform's namespace: a
 // Deployment of two replicas, another whose name starts like it, a pod with
 // two containers, a StatefulSet's pod and a Job's.
 func exampleNamespace(p *fakePortal) {
+	verify := owned("zaentrum-verify-fzzgp-gsg9z", "Job", "zaentrum-verify-fzzgp", "doctor")
+	verify.Phase = "Succeeded"
 	p.pods = []Pod{
-		{Pod: "chino-api-7d79fd4c4b-xprff", Phase: "Running", Containers: []string{"app"}},
-		{Pod: "chino-api-7d79fd4c4b-qfmtj", Phase: "Running", Containers: []string{"app"}},
-		{Pod: "chino-api-worker-5c5b77b969-rhbqb", Phase: "Running", Containers: []string{"app"}},
-		{Pod: "chino-web-58f8548947-ljdwb", Phase: "Running", Containers: []string{"app"}},
-		{Pod: "portal-api-554bd55786-krtkx", Phase: "Running", Containers: []string{"app", "proxy"}},
-		{Pod: "postgres-0", Phase: "Running", Containers: []string{"postgres"}},
-		{Pod: "zaentrum-verify-fzzgp-gsg9z", Phase: "Succeeded", Containers: []string{"doctor"}},
+		owned("chino-api-7d79fd4c4b-xprff", "Deployment", "chino-api", "app"),
+		owned("chino-api-7d79fd4c4b-qfmtj", "Deployment", "chino-api", "app"),
+		owned("chino-api-worker-5c5b77b969-rhbqb", "Deployment", "chino-api-worker", "app"),
+		owned("chino-web-58f8548947-ljdwb", "Deployment", "chino-web", "app"),
+		owned("portal-api-554bd55786-krtkx", "Deployment", "portal-api", "app", "proxy"),
+		owned("postgres-0", "StatefulSet", "postgres", "postgres"),
+		verify,
 	}
 	p.logs = map[string][]string{
 		"chino-api-7d79fd4c4b-xprff/app":        {line(1, "first replica starts"), line(4, "first replica serves")},
