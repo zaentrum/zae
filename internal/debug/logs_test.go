@@ -187,6 +187,72 @@ func TestLogsPrintsWhatItCouldRead(t *testing.T) {
 	}
 }
 
+// A pod that went between the listing and the read is 404 from the portal.
+// Asked for by its own name, that is exit 3 — no such pod runs now — naming the
+// workload whose pods run in its place. One pod of a workload going is a
+// rollout under way: it is said, and the others are printed. A workload none
+// of whose listed pods could be read is undetermined: its pods are being
+// replaced, which says nothing about whether it runs.
+func TestLogsOfAPodThatWentAfterTheListing(t *testing.T) {
+	p, srv := newPortal(t)
+	exampleNamespace(p)
+	p.vanished["postgres-0"] = true
+	code, out, errs := run(t, "logs", "postgres-0", "--url", srv.URL)
+	if code != exitcode.NotOffered || out != "" {
+		t.Fatalf("a pod asked for by its own name, gone: want 3 and nothing printed, got %d\n%s\n%s", code, out, errs)
+	}
+	for _, s := range []string{`no pod "postgres-0" runs on ` + srv.URL + " now — it was listed a moment ago, and is gone",
+		"zae debug logs postgres --url " + srv.URL + " reads the pods of postgres"} {
+		if !strings.Contains(errs, s) {
+			t.Errorf("the message lacks %q: %q", s, errs)
+		}
+	}
+
+	p.vanished = map[string]bool{"chino-api-7d79fd4c4b-xprff": true}
+	code, out, errs = run(t, "logs", "chino-api", "--url", srv.URL)
+	if code != exitcode.OK || !strings.Contains(out, "second replica serves") || strings.Contains(out, "first replica") {
+		t.Fatalf("one replica gone: want 0 and the other's lines, got %d\n%s\n%s", code, out, errs)
+	}
+	if !strings.Contains(errs, "note: chino-api-7d79fd4c4b-xprff/app is gone — it stopped after zae listed the pods of chino-api") {
+		t.Errorf("the replica that went is said: %q", errs)
+	}
+
+	p.vanished["chino-api-7d79fd4c4b-qfmtj"] = true
+	code, out, errs = run(t, "logs", "chino-api", "--url", srv.URL)
+	if code != exitcode.Undetermined || out != "" || !strings.Contains(errs, "undetermined: every pod of chino-api that zae listed") {
+		t.Fatalf("every replica gone: want 4, got %d\n%s\n%s", code, out, errs)
+	}
+
+	// An older portal-api answered a pod that is not there 500, in the
+	// apiserver's words: a read that failed, as it always was.
+	p.legacy, p.vanished = true, map[string]bool{"postgres-0": true}
+	if code, _, errs := run(t, "logs", "postgres-0", "--url", srv.URL); code != exitcode.Failed || !strings.Contains(errs, "HTTP 500") {
+		t.Errorf("an older portal-api: want 1, got %d %q", code, errs)
+	}
+}
+
+// A read the apiserver refuses as asked is 400 from the portal, in its words.
+// A container the pod does not run — it was replaced under the same name — is
+// not there: exit 3. One waiting to start cannot be read yet: exit 1. Either
+// way the containers that could be read are printed.
+func TestLogsOfAContainerTheClusterRefuses(t *testing.T) {
+	p, srv := newPortal(t)
+	exampleNamespace(p)
+	p.refused["portal-api-554bd55786-krtkx/proxy"] = "container proxy is not valid for pod portal-api-554bd55786-krtkx"
+	code, out, errs := run(t, "logs", "portal-api", "--url", srv.URL)
+	if code != exitcode.NotOffered || !strings.Contains(out, "portal app") ||
+		!strings.Contains(errs, `not offered: pod portal-api-554bd55786-krtkx runs no container "proxy" now: container proxy is not valid`) {
+		t.Fatalf("a container the pod does not run: want 3 after the rest, got %d\n%s\n%s", code, out, errs)
+	}
+
+	p.refused = map[string]string{"chino-api-7d79fd4c4b-qfmtj/app": `container "app" in pod "chino-api-7d79fd4c4b-qfmtj" is waiting to start: ContainerCreating`}
+	code, out, errs = run(t, "logs", "chino-api", "--url", srv.URL)
+	if code != exitcode.Failed || !strings.Contains(out, "first replica serves") ||
+		!strings.Contains(errs, `failed: chino-api-7d79fd4c4b-qfmtj/app cannot be read now: container "app" in pod "chino-api-7d79fd4c4b-qfmtj" is waiting to start`) {
+		t.Fatalf("a container waiting to start: want 1 after the rest, got %d\n%s\n%s", code, out, errs)
+	}
+}
+
 func TestMatchAndWorkloadNames(t *testing.T) {
 	for pod, want := range map[string]string{
 		"chino-api-7d79fd4c4b-xprff":  "chino-api",
@@ -341,6 +407,81 @@ func TestFollowRidesOutAFailureAndStopsAtARefusal(t *testing.T) {
 	// with, so even one pod's lines say whose they are.
 	if !strings.Contains(out, "[postgres-0/postgres] "+line(9, "after the hiccup")) {
 		t.Errorf("a followed workload's lines carry their pod:\n%s", out)
+	}
+}
+
+// In a follow, a pod that went is a rollout under way: said once, and the
+// follow goes on. A pod that comes back under its own name — a StatefulSet's —
+// is read again; one the listing drops is not said to be gone a second time.
+func TestFollowRidesOutAPodThatWent(t *testing.T) {
+	p, srv := newPortal(t)
+	exampleNamespace(p)
+	k := "postgres-0/postgres"
+	p.onList = func(p *fakePortal, n int) {
+		switch n {
+		case 2, 3:
+			p.vanished["postgres-0"] = true // deleted, and listed a moment longer
+		case 4:
+			delete(p.vanished, "postgres-0") // the StatefulSet made it again
+			p.logs[k] = append(p.logs[k], line(9, "database system is ready again"))
+		case 6:
+			go interrupt()
+		}
+	}
+	code, out, errs := run(t, "logs", "postgres", "--url", srv.URL, "--follow")
+	if code != 130 {
+		t.Fatalf("a pod that went does not end a follow: want 130, got %d\n%s\n%s", code, out, errs)
+	}
+	if n := strings.Count(errs, "postgres-0/postgres is gone — still following postgres"); n != 1 {
+		t.Errorf("said %d times, want once:\n%s", n, errs)
+	}
+	if !strings.Contains(errs, "reading postgres-0/postgres again") || !strings.Contains(out, "database system is ready again") {
+		t.Errorf("the pod back under its name is read again:\n%s\n%s", out, errs)
+	}
+
+	p2, srv2 := newPortal(t)
+	exampleNamespace(p2)
+	p2.onList = func(p *fakePortal, n int) {
+		switch n {
+		case 2:
+			p.vanished["chino-api-7d79fd4c4b-xprff"] = true // deleted, still in this listing
+		case 3:
+			p.pods = p.pods[1:] // and out of the next
+		case 5:
+			go interrupt()
+		}
+	}
+	code, out, errs = run(t, "logs", "chino-api", "--url", srv2.URL, "--follow")
+	if code != 130 || strings.Count(errs, "chino-api-7d79fd4c4b-xprff/app is gone") != 1 {
+		t.Fatalf("a pod that went is said once, read or listed: %d\n%s\n%s", code, out, errs)
+	}
+}
+
+// A container the pod no longer runs — it was replaced under the same name —
+// is exit 3 for a read on its own, and no reason to end a follow: said once,
+// and the listing says what runs instead.
+func TestFollowRidesOutAContainerThePodNoLongerRuns(t *testing.T) {
+	p, srv := newPortal(t)
+	exampleNamespace(p)
+	p.onList = func(p *fakePortal, n int) {
+		switch n {
+		case 2, 3:
+			p.refused["portal-api-554bd55786-krtkx/proxy"] = "container proxy is not valid for pod portal-api-554bd55786-krtkx"
+		case 4:
+			p.pods[4].Containers = []string{"app"}
+		case 6:
+			go interrupt()
+		}
+	}
+	code, out, errs := run(t, "logs", "portal-api", "--url", srv.URL, "--follow")
+	if code != 130 {
+		t.Fatalf("want 130, got %d\n%s\n%s", code, out, errs)
+	}
+	if n := strings.Count(errs, `runs no container "proxy" now`); n != 1 {
+		t.Errorf("said %d times, want once:\n%s", n, errs)
+	}
+	if !strings.Contains(errs, "portal-api-554bd55786-krtkx/proxy is gone") {
+		t.Errorf("the listing that no longer has it says so:\n%s", errs)
 	}
 }
 

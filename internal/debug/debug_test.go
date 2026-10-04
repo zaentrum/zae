@@ -33,11 +33,18 @@ type fakePortal struct {
 
 	token string // required bearer, "" for none
 	// legacy is a portal-api from before the pods named the workload that
-	// runs them: it lists each pod without its owner.
+	// runs them: it lists each pod without its owner, and answers a log read
+	// of a pod that is not there 500, in the apiserver's words.
 	legacy bool
 	pods   []Pod
 	logs   map[string][]string // pod/container → lines, timestamp first
 	broken map[string]string   // pod/container → a 500 the log read answers
+	// refused is a read the apiserver refuses as asked: pod/container → the
+	// 400 it answers, in its words (a container waiting to start).
+	refused map[string]string
+	// vanished are pods still listed whose log read finds them gone: deleted
+	// between the listing and the read.
+	vanished map[string]bool
 	// logs503 answers every log read with 503 and this body.
 	logs503 string
 
@@ -49,7 +56,7 @@ type fakePortal struct {
 }
 
 func newPortal(t *testing.T) (*fakePortal, *httptest.Server) {
-	p := &fakePortal{logs: map[string][]string{}, broken: map[string]string{},
+	p := &fakePortal{logs: map[string][]string{}, broken: map[string]string{}, refused: map[string]string{}, vanished: map[string]bool{},
 		topology: `{"available":true,"brokers":["kafka:9092"],"topics":[{"topic":"platform.item.added","partitions":1},{"topic":"platform.item.removed","partitions":1}],"groups":["workers"]}`,
 		events:   `[]`}
 	mux := http.NewServeMux()
@@ -89,7 +96,9 @@ func newPortal(t *testing.T) (*fakePortal, *httptest.Server) {
 }
 
 // log answers one container's log as the portal does: text, a line per
-// line, the last tail of them (500 when none is asked for).
+// line, the last tail of them (500 when none is asked for). A pod the
+// namespace does not run is 404, a container the pod does not run 400 — or,
+// from a legacy portal, both a 500 in the apiserver's words.
 func (p *fakePortal) log(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	p.logQ = append(p.logQ, q)
@@ -97,14 +106,37 @@ func (p *fakePortal) log(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, p.logs503, http.StatusServiceUnavailable)
 		return
 	}
-	key := q.Get("pod") + "/" + q.Get("container")
+	pod, container := q.Get("pod"), q.Get("container")
+	key := pod + "/" + container
 	if msg, ok := p.broken[key]; ok {
 		http.Error(w, msg, http.StatusInternalServerError)
 		return
 	}
+	if msg, ok := p.refused[key]; ok {
+		status := http.StatusBadRequest
+		if p.legacy {
+			status, msg = http.StatusInternalServerError, "k8s 400 BadRequest: "+msg
+		}
+		http.Error(w, msg, status)
+		return
+	}
+	var listed *Pod
+	for i := range p.pods {
+		if p.pods[i].Pod == pod {
+			listed = &p.pods[i]
+		}
+	}
 	lines, ok := p.logs[key]
-	if !ok {
-		http.Error(w, fmt.Sprintf("k8s 404 NotFound: pods %q not found", q.Get("pod")), http.StatusInternalServerError)
+	switch {
+	case p.legacy && (!ok || p.vanished[pod]):
+		http.Error(w, fmt.Sprintf("k8s 404 NotFound: pods %q not found", pod), http.StatusInternalServerError)
+		return
+	case p.legacy:
+	case listed == nil || p.vanished[pod]:
+		http.Error(w, fmt.Sprintf("no pod %q runs in this namespace", pod), http.StatusNotFound)
+		return
+	case !contains(listed.Containers, container):
+		http.Error(w, fmt.Sprintf("container %s is not valid for pod %s", container, pod), http.StatusBadRequest)
 		return
 	}
 	tail := 500

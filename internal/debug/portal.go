@@ -30,6 +30,10 @@ const adminNeed = "the debug console needs the platform's admin role"
 // where it has no pods to read: the one 503 that is definitive.
 const outsideCluster = "log viewer is unavailable"
 
+// routerNotFound is the router's own 404: no such route, which is a
+// portal-api older than it — not the API answering about what was asked.
+const routerNotFound = "404 page not found"
+
 // apiError is a call that did not succeed, already mapped onto the exit-code
 // contract, with the message to print.
 type apiError struct {
@@ -41,6 +45,12 @@ type apiError struct {
 	// transient: no answer, or the portal failing for a moment — worth asking
 	// again while following, never a verdict.
 	transient bool
+	// gone: a log read the portal answered 404 — the pod went after zae
+	// listed it. noContainer: one it answered 400 because the pod does not
+	// run that container (it was replaced under the same name). Both are
+	// definitive about that one read, and neither ends a follow, whose next
+	// listing says what runs instead.
+	gone, noContainer bool
 }
 
 func (e *apiError) Error() string { return e.msg }
@@ -104,7 +114,7 @@ func (c *client) get(ctx context.Context, what, path string, limit int64) ([]byt
 			msg: fmt.Sprintf("forbidden: %s: %s answered %d — %s", what, c.base, s, instance.ForbiddenHint(c.base, adminNeed))}
 	case s == http.StatusNotFound:
 		route, _, _ := strings.Cut(path, "?")
-		if strings.TrimSpace(string(raw)) == "404 page not found" {
+		if strings.TrimSpace(string(raw)) == routerNotFound {
 			// The router's own 404: a portal-api that predates the route.
 			return nil, &apiError{said: excerpt(raw), code: exitcode.NotOffered, status: s,
 				msg: fmt.Sprintf("not offered: %s does not serve %s — its portal-api predates it", c.base, route)}

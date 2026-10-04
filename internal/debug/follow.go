@@ -28,6 +28,11 @@ type followed struct {
 	// trouble is the last failure said about this container, so a failure that
 	// repeats every round is said once.
 	trouble string
+	// gone: the portal answered that the pod is gone. It is said once, and the
+	// listing that drops the pod does not say it again; it is read on all the
+	// same while it is listed, since a StatefulSet's pod comes back under its
+	// own name.
+	gone bool
 }
 
 // fresh keeps the lines not printed yet.
@@ -62,10 +67,15 @@ func (f *followed) remember(es []entry) {
 func note(format string, a ...any) { errf("note: "+format, a...) }
 
 // stopsAFollow reports whether a failure ends a follow: a refused bearer, or
-// an instance with nothing to read, does not get better by asking again.
+// an instance with nothing to read, does not get better by asking again. A pod
+// that went, or a container a pod no longer runs, is a rollout under way —
+// what the follow is there to take up.
 func stopsAFollow(err error) bool {
 	ae, ok := asAPIError(err)
-	return ok && (ae.code == exitcode.Forbidden || ae.code == exitcode.NotOffered || ae.code == exitcode.Usage)
+	if !ok || ae.gone || ae.noContainer {
+		return false
+	}
+	return ae.code == exitcode.Forbidden || ae.code == exitcode.NotOffered || ae.code == exitcode.Usage
 }
 
 // followLogs prints the first read the flags ask for, then reads every
@@ -91,6 +101,12 @@ func followLogs(s *session, c *client, name, container string, srcs []source, fi
 		switch {
 		case s.interrupted():
 			return nil, s.exitCode(), true
+		case err != nil && isGone(err):
+			if !f.gone {
+				f.gone = true
+				note("%s is gone — still following %s", f.src, name)
+			}
+			return nil, exitcode.OK, false
 		case err != nil && stopsAFollow(err):
 			return nil, fail(err), true
 		case err != nil:
@@ -100,8 +116,8 @@ func followLogs(s *session, c *client, name, container string, srcs []source, fi
 			}
 			return nil, exitcode.OK, false
 		}
-		if f.trouble != "" {
-			f.trouble = ""
+		if f.trouble != "" || f.gone {
+			f.trouble, f.gone = "", false
 			note("reading %s again", f.src)
 		}
 		fresh := es
@@ -156,7 +172,9 @@ func followLogs(s *session, c *client, name, container string, srcs []source, fi
 					kept = append(kept, src)
 					continue
 				}
-				note("%s is gone", src)
+				if !tracked[src].gone {
+					note("%s is gone", src)
+				}
 				delete(tracked, src)
 			}
 			order = kept

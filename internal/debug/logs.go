@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"regexp"
 	"sort"
@@ -141,22 +142,57 @@ func logs(args []string) int {
 
 	var all []entry
 	failed := exitcode.OK
+	read, gone := 0, 0
 	for _, src := range srcs {
 		es, err := readLog(s.ctx, c, src, first)
 		if s.interrupted() {
 			return s.exitCode()
 		}
-		if err != nil {
+		switch {
+		case err != nil && isGone(err) && exact:
+			return gonePod(base, src, pods)
+		case err != nil && isGone(err):
+			// One pod of the workload went between the listing and the read —
+			// a rollout replacing it, most likely. Its lines went with it; it
+			// is said, and the rest are printed.
+			gone++
+			note("%s is gone — it stopped after zae listed the pods of %s", src, name)
+			continue
+		case err != nil:
 			code := fail(err)
 			if failed == exitcode.OK {
 				failed = code
 			}
 			continue
 		}
+		read++
 		all = append(all, es...)
 	}
 	w.print(merge(all))
+	if gone > 0 && read == 0 && failed == exitcode.OK {
+		// Nothing listed was there to read. That says nothing about whether
+		// the workload runs — its pods are being replaced — so it is not "not
+		// offered": zae could not find out, and asking again will.
+		errf("undetermined: every pod of %s that zae listed on %s was gone by the time it was read — they are being replaced, most likely: run it again", name, base)
+		return exitcode.Undetermined
+	}
 	return failed
+}
+
+// gonePod is exit 3 for a pod asked for by its own name that went after it
+// was listed, naming the workload whose pods run in its place.
+func gonePod(base string, src source, pods []Pod) int {
+	msg := fmt.Sprintf("not offered: no pod %q runs on %s now — it was listed a moment ago, and is gone", src.pod, base)
+	for _, p := range pods {
+		if p.Pod == src.pod {
+			if wl := p.workload(); wl != p.Pod {
+				msg += fmt.Sprintf(" — zae debug logs %s --url %s reads the pods of %s", wl, base, wl)
+			}
+			break
+		}
+	}
+	errf("%s", msg)
+	return exitcode.NotOffered
 }
 
 // failOr is fail, unless a signal ended the session.
@@ -335,9 +371,44 @@ func logPath(src source, q query) string {
 func readLog(ctx context.Context, c *client, src source, q query) ([]entry, error) {
 	raw, err := c.get(ctx, "logs of "+src.String(), logPath(src, q), logLimit)
 	if err != nil {
-		return nil, err
+		return nil, refusedRead(c.base, src, err)
 	}
 	return parseLog(src, raw), nil
+}
+
+// refusedRead words a log read the portal answered with its own 404 or 400,
+// which each say something different about the one container asked for:
+//
+//	404  the namespace runs no pod by that name: it went after zae listed it
+//	400  the apiserver refused the read as asked, in its words — a container
+//	     the pod does not run (it was replaced under the same name), or one
+//	     that is still waiting to start
+//
+// A portal-api older than the distinction answered 500 for both, which stays
+// what it was: a read that failed.
+func refusedRead(base string, src source, err error) error {
+	ae, ok := asAPIError(err)
+	if !ok {
+		return err
+	}
+	switch {
+	case ae.status == http.StatusNotFound && ae.said != routerNotFound:
+		return &apiError{code: exitcode.NotOffered, status: ae.status, said: ae.said, gone: true,
+			msg: fmt.Sprintf("not offered: no pod %q runs on %s now — it was listed a moment ago, and is gone", src.pod, base)}
+	case ae.status == http.StatusBadRequest && strings.Contains(ae.said, "is not valid for pod"):
+		return &apiError{code: exitcode.NotOffered, status: ae.status, said: ae.said, noContainer: true,
+			msg: fmt.Sprintf("not offered: pod %s runs no container %q now: %s", src.pod, src.container, ae.said)}
+	case ae.status == http.StatusBadRequest:
+		return &apiError{code: exitcode.Failed, status: ae.status, said: ae.said,
+			msg: fmt.Sprintf("failed: %s cannot be read now: %s", src, ae.said)}
+	}
+	return err
+}
+
+// isGone reports whether a read found its pod gone.
+func isGone(err error) bool {
+	ae, ok := asAPIError(err)
+	return ok && ae.gone
 }
 
 // entry is one log line. The portal asks the cluster for timestamps, so every

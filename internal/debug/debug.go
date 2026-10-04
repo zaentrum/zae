@@ -79,9 +79,11 @@ Nothing here writes to the instance.
 
 Needs the platform's admin role: sign in with 'zae login --url …', or carry a
 bearer in ZAE_TOKEN (which wins when it is set).
-Exit codes: 0 done · 1 the instance returned an error · 2 usage · 3 not offered
-(no such workload, container or topic; no cluster, no event bus) · 4
-undetermined · 5 forbidden · 130/143 interrupted.
+Exit codes: 0 done · 1 the instance returned an error, or a container cannot be
+read yet · 2 usage · 3 not offered (no such workload, pod, container or topic —
+a pod gone since it was listed too; no cluster, no event bus) · 4 undetermined
+(every pod of a workload gone as it was read included) · 5 forbidden · 130/143
+interrupted.
 `)
 }
 
