@@ -53,6 +53,9 @@ func usage(w io.Writer) {
 Usage:
   zae setup --url https://… [--json]
   zae setup metadata --url https://… --tmdb-key-file FILE|--tmdb-key-stdin [--yes]
+  zae setup scan --url https://…
+  zae setup done --url https://… [--yes]
+  zae setup reopen --url https://…
 
 The checklist is what the launchpad shows an admin until one marks setup
 done: metadata (a TMDB key), library (the titles, where files go, the latest
@@ -64,9 +67,14 @@ one's state and what to do next. --json prints the portal's own document.
 metadata sets the catalog's TMDB key: TMDB's API read access token (v4, it
 starts with eyJ). It is read from a file, or from stdin — asked for without
 echo on a terminal — and never taken as an argument, where it would land in
-shell history; zae never prints it. It prints what changes and asks first;
---yes skips the question, and without a terminal on stdin it is required —
-without it zae exits 2 before anything is written.
+shell history; zae never prints it. scan starts a scan of the library, unless
+one is under way. done marks setup done, so the launchpad stops showing the
+checklist; reopen shows it again.
+
+metadata prints what changes and asks first, and so does done while steps
+are open. --yes skips the question; without a terminal on stdin it is
+required, and without it zae exits 2 before anything is written. scan and
+reopen do not ask, as the console does not.
 
 Needs the platform's admin role: sign in with 'zae login --url …', or carry a
 bearer in ZAE_TOKEN (which wins when it is set).
@@ -105,6 +113,12 @@ func Run(args []string) int {
 	switch args[0] {
 	case "metadata":
 		return metadata(args[1:])
+	case "scan":
+		return scan(args[1:])
+	case "done":
+		return done(args[1:])
+	case "reopen":
+		return reopen(args[1:])
 	case "help", "--help", "-h":
 		usage(stdout)
 		return exitcode.OK
@@ -117,7 +131,7 @@ func Run(args []string) int {
 }
 
 // writes names the commands that work through the checklist.
-const writes = "metadata"
+const writes = "metadata, scan, done and reopen"
 
 // checklist prints every step of the checklist, its state and what to do
 // next.

@@ -3,6 +3,7 @@ package setup
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -75,6 +76,21 @@ func newPortal(t *testing.T, doc Doc) (*fakePortal, *httptest.Server) {
 		writeJSON(w, http.StatusOK, p.doc)
 	})
 	mux.HandleFunc("POST "+metadataPath, p.setKey)
+	mux.HandleFunc("POST "+scanPath, p.scan)
+	mux.HandleFunc("GET "+completePath, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, completion{Completed: p.doc.Completed})
+	})
+	mux.HandleFunc("POST "+completePath, func(w http.ResponseWriter, r *http.Request) {
+		// The first admin to mark it done is the one the record names.
+		if p.doc.Completed == nil {
+			p.doc.Completed = &Completion{At: clock, By: "admin"}
+		}
+		writeJSON(w, http.StatusOK, completion{Completed: p.doc.Completed})
+	})
+	mux.HandleFunc("DELETE "+completePath, func(w http.ResponseWriter, r *http.Request) {
+		p.doc.Completed = nil
+		w.WriteHeader(http.StatusNoContent)
+	})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		p.mu.Lock()
@@ -135,6 +151,27 @@ func (p *fakePortal) setKey(w http.ResponseWriter, r *http.Request) {
 		p.doc.Metadata = Metadata{Step: Step{State: "set to " + key, Note: "now " + key}, Key: key}
 	}
 	writeJSON(w, http.StatusOK, p.doc)
+}
+
+// scan is POST /setup/library/scan: a body, when one is sent, must be empty;
+// the catalog manager starts the scan — or does not — and the answer is the
+// checklist with the scan running in it, 202.
+func (p *fakePortal) scan(w http.ResponseWriter, r *http.Request) {
+	var body struct{}
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if a, ok := catalogAnswers[p.catalog]; ok {
+		http.Error(w, a.body, a.status)
+		return
+	}
+	at := clock
+	p.doc.Library.State = stateWorking
+	p.doc.Library.Scan = &ScanJob{ID: "scan-8", Status: "running", StartedAt: &at}
+	writeJSON(w, http.StatusAccepted, p.doc)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
