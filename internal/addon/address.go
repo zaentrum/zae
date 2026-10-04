@@ -28,8 +28,9 @@ import (
 // One call does both halves. POST /api/portal/addons with dryRun answers what
 // installing would do and writes nothing — the console's "check" — and
 // without it installs, or refreshes an addon installed from that address.
-// DELETE /api/portal/addons/{key} removes what the portal created. There is no
-// read of one such addon: the list carries them all.
+// DELETE /api/portal/addons/{key} removes what the portal created, and GET
+// answers that addon's row of the list; a portal-api older than the GET has
+// only the list.
 
 // spacesPath lists the launchpad's spaces, for a --space that names one.
 const spacesPath = "/api/portal/spaces"
@@ -93,6 +94,31 @@ func findListed(ctx context.Context, c *client, name string) (*Listed, json.RawM
 	return nil, nil, nil
 }
 
+// findOne reads the row for name — GET /api/portal/addons/{key}, which answers
+// it exactly as the list has it — with its own JSON; row is nil when there is
+// no addon by that key. A portal-api older than that read answers 405 (it
+// serves only the DELETE) or its router's 404, and the list is read instead.
+func findOne(ctx context.Context, c *client, name string) (*Listed, json.RawMessage, error) {
+	var raw json.RawMessage
+	err := c.do(ctx, "status of "+name, http.MethodGet, addonsPath+"/"+url.PathEscape(name), nil, &raw, "")
+	if err == nil {
+		var r Listed
+		if json.Unmarshal(raw, &r) != nil || r.key() == "" {
+			return nil, nil, &apiError{code: exitcode.Undetermined,
+				msg: fmt.Sprintf("undetermined: status of %s: %s answered with JSON that is not an addon's row", name, c.base)}
+		}
+		return &r, raw, nil
+	}
+	ae, ok := asAPIError(err)
+	switch {
+	case ok && (ae.noAPI || ae.status == http.StatusMethodNotAllowed):
+		return findListed(ctx, c, name)
+	case ok && ae.notFound:
+		return nil, nil, nil
+	}
+	return nil, nil, err
+}
+
 // fallsBack: the chart API has no addon of that name — or the instance cannot
 // install from charts at all — so an addon added by its address is looked
 // for. Not on a failure to ask: that is no answer about either kind.
@@ -101,10 +127,10 @@ func fallsBack(err error) bool {
 	return ok && (ae.notFound || ae.noAPI)
 }
 
-// statusByAddress prints an addon from the addons list: one added by its
-// address, which only the list carries.
+// statusByAddress prints an addon from the portal's rows: one added by its
+// address, which only they carry.
 func statusByAddress(ctx context.Context, c *client, base, name string, asJSON bool) int {
-	row, raw, err := findListed(ctx, c, name)
+	row, raw, err := findOne(ctx, c, name)
 	if err != nil {
 		return fail(err)
 	}

@@ -183,7 +183,8 @@ type removal struct {
 
 // Listed is one row of GET /api/portal/addons: every installed addon, with
 // chart information merged in for chart addons. It is the only read there is
-// of an addon added by its address.
+// of an addon added by its address — the whole list, or GET
+// /api/portal/addons/{key} for the one row.
 type Listed struct {
 	Key      string `json:"key"`
 	Name     string `json:"name"`

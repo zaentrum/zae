@@ -63,6 +63,9 @@ type fakeAddresses struct {
 	refuse     int // the status every install answers with, its body in refusal
 	refusal    string
 	installs   int
+	// olderRead is a portal-api older than GET /addons/{key}: "405" serves
+	// only its DELETE, as the router then answers; "404" serves neither.
+	olderRead string
 }
 
 func newAddresses(t *testing.T) (*fakeAddresses, *httptest.Server) {
@@ -72,6 +75,7 @@ func newAddresses(t *testing.T) (*fakeAddresses, *httptest.Server) {
 		tiles: 1, slots: 1, commands: 2, workload: "sample-addon"}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET "+addonsPath, f.list)
+	mux.HandleFunc("GET "+addonsPath+"/{key}", f.one)
 	mux.HandleFunc("POST "+addonsPath, f.install)
 	mux.HandleFunc("DELETE "+addonsPath+"/{key}", f.remove)
 	mux.HandleFunc("GET "+spacesPath, func(w http.ResponseWriter, r *http.Request) {
@@ -159,6 +163,26 @@ func (f *fakeAddresses) list(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(out)
 }
 
+// one is GET /api/portal/addons/{key}: the addon's row of the list, exactly,
+// or the portal's own 404.
+func (f *fakeAddresses) one(w http.ResponseWriter, r *http.Request) {
+	switch f.olderRead {
+	case "405":
+		w.Header().Set("Allow", http.MethodDelete)
+		w.WriteHeader(http.StatusMethodNotAllowed) // the router's, with no body
+		return
+	case "404":
+		http.NotFound(w, r)
+		return
+	}
+	a := f.addons[r.PathValue("key")]
+	if a == nil {
+		http.Error(w, "no such addon", http.StatusNotFound)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(f.row(a))
+}
+
 // install is POST /api/portal/addons, check and install both.
 func (f *fakeAddresses) install(w http.ResponseWriter, r *http.Request) {
 	var body struct {
@@ -233,6 +257,13 @@ func (f *fakeAddresses) remove(w http.ResponseWriter, r *http.Request) {
 		"remainingWorkloads": []string{a.workload}})
 }
 
+// forget drops the calls recorded so far.
+func (f *fakeAddresses) forget() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = nil
+}
+
 func (f *fakeAddresses) called(key string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -303,6 +334,9 @@ func TestStatusOfAnAddonAddedByItsAddress(t *testing.T) {
 	if f.called("GET "+chartsPath+"/sample") != 1 || f.called("GET /api/portal/apps/sample/api/setup") != 1 {
 		t.Errorf("the chart API is asked first, the addon's setup through the proxy: %v", f.calls)
 	}
+	if f.called("GET "+addonsPath+"/sample") != 1 || f.called("GET "+addonsPath) != 0 {
+		t.Errorf("the addon's own row is read, not the list: %v", f.calls)
+	}
 
 	// --json is the portal's own row.
 	code, out, _ = run(t, "", false, "status", "sample", "--url", srv.URL, "--json")
@@ -331,6 +365,42 @@ func TestStatusOfAnAddonAddedByItsAddress(t *testing.T) {
 	if code != exitcode.OK || !regexpLine(out, `^  setup       unknown — the addon did not answer its setup check at /api/setup$`) ||
 		!regexpLine(out, `^    Storage\s+required\s+where files go$`) {
 		t.Errorf("a setup that did not answer: %d\n%s", code, out)
+	}
+}
+
+// status reads the one addon's row, GET /addons/{key}, rather than the whole
+// list — the portal's own 404 there is "no such addon", and the list is not
+// read to find out again. A portal-api older than the read answers 405 (it
+// serves only the DELETE) or its router's 404, and the list answers as before.
+func TestStatusReadsTheAddonsOwnRow(t *testing.T) {
+	f, srv := newAddresses(t)
+	f.sample("1.2.0")
+	code, out, errs := run(t, "", false, "status", "sample", "--url", srv.URL, "--json")
+	var row map[string]any
+	if code != exitcode.OK || json.Unmarshal([]byte(out), &row) != nil || row["key"] != "sample" || row["proxyUrl"] != "http://sample-addon" {
+		t.Fatalf("--json is the portal's row for it: %d %q %q", code, out, errs)
+	}
+	if f.called("GET "+addonsPath+"/sample") != 1 || f.called("GET "+addonsPath) != 0 {
+		t.Fatalf("one row is read, not the list: %v", f.calls)
+	}
+
+	f.forget()
+	code, _, errs = run(t, "", false, "status", "nosuch", "--url", srv.URL)
+	if code != exitcode.NotOffered || !strings.Contains(errs, `has no addon "nosuch"`) || f.called("GET "+addonsPath) != 0 {
+		t.Fatalf("the portal's own 404: want 3 without the list, got %d %q %v", code, errs, f.calls)
+	}
+
+	for _, older := range []string{"405", "404"} {
+		f.olderRead = older
+		f.forget()
+		code, out, errs := run(t, "", false, "status", "sample", "--url", srv.URL)
+		if code != exitcode.OK || !strings.Contains(out, "added by its address") || f.called("GET "+addonsPath) != 1 {
+			t.Errorf("an older portal-api (%s): want the list's row, got %d %v\n%s\n%s", older, code, f.calls, out, errs)
+		}
+		code, _, errs = run(t, "", false, "status", "nosuch", "--url", srv.URL)
+		if code != exitcode.NotOffered || !strings.Contains(errs, `has no addon "nosuch"`) {
+			t.Errorf("an older portal-api (%s), no such addon: want 3, got %d %q", older, code, errs)
+		}
 	}
 }
 
@@ -453,8 +523,9 @@ func TestOnlyNoSuchAddonFallsBackToTheList(t *testing.T) {
 	f.sample("1.2.0")
 	f.chartsFail = true
 	code, out, errs := run(t, "", false, "status", "sample", "--url", srv.URL)
-	if code != exitcode.Failed || !strings.Contains(errs, "etcdserver: request timed out") || f.called("GET "+addonsPath) != 0 {
-		t.Fatalf("a failing chart API: want 1 without reading the list, got %d\n%s\n%s", code, out, errs)
+	if code != exitcode.Failed || !strings.Contains(errs, "etcdserver: request timed out") ||
+		f.called("GET "+addonsPath) != 0 || f.called("GET "+addonsPath+"/sample") != 0 {
+		t.Fatalf("a failing chart API: want 1 without reading the addon's row, got %d\n%s\n%s", code, out, errs)
 	}
 	f.chartsFail = false
 
