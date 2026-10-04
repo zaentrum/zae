@@ -208,6 +208,14 @@ func TestLogsOfAPodThatWentAfterTheListing(t *testing.T) {
 		}
 	}
 
+	// Gone between the reads of two of its containers: what the first one
+	// answered is printed all the same.
+	p.vanished = map[string]bool{"portal-api-554bd55786-krtkx/proxy": true}
+	code, out, errs = run(t, "logs", "portal-api-554bd55786-krtkx", "--url", srv.URL)
+	if code != exitcode.NotOffered || !strings.Contains(out, "portal app") || !strings.Contains(errs, `no pod "portal-api-554bd55786-krtkx" runs on`) {
+		t.Fatalf("gone between two containers: want 3 after the first one's lines, got %d\n%s\n%s", code, out, errs)
+	}
+
 	p.vanished = map[string]bool{"chino-api-7d79fd4c4b-xprff": true}
 	code, out, errs = run(t, "logs", "chino-api", "--url", srv.URL)
 	if code != exitcode.OK || !strings.Contains(out, "second replica serves") || strings.Contains(out, "first replica") {

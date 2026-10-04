@@ -150,6 +150,8 @@ func logs(args []string) int {
 		}
 		switch {
 		case err != nil && isGone(err) && exact:
+			// What its other containers answered before it went is printed.
+			w.print(merge(all))
 			return gonePod(base, src, pods)
 		case err != nil && isGone(err):
 			// One pod of the workload went between the listing and the read —

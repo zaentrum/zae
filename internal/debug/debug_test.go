@@ -43,7 +43,8 @@ type fakePortal struct {
 	// 400 it answers, in its words (a container waiting to start).
 	refused map[string]string
 	// vanished are pods still listed whose log read finds them gone: deleted
-	// between the listing and the read.
+	// between the listing and the read — by pod, or by pod/container for one
+	// deleted between the reads of two of its containers.
 	vanished map[string]bool
 	// refuseSinceTime answers a read that names sinceTime 400, with these
 	// words: a portal that refuses the parameter rather than ignoring it.
@@ -158,11 +159,11 @@ func (p *fakePortal) log(w http.ResponseWriter, r *http.Request) {
 	}
 	lines, ok := p.logs[key]
 	switch {
-	case p.legacy && (!ok || p.vanished[pod]):
+	case p.legacy && (!ok || p.vanished[pod] || p.vanished[key]):
 		http.Error(w, fmt.Sprintf("k8s 404 NotFound: pods %q not found", pod), http.StatusInternalServerError)
 		return
 	case p.legacy:
-	case listed == nil || p.vanished[pod]:
+	case listed == nil || p.vanished[pod] || p.vanished[key]:
 		http.Error(w, fmt.Sprintf("no pod %q runs in this namespace", pod), http.StatusNotFound)
 		return
 	case !contains(listed.Containers, container):
