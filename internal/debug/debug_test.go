@@ -45,6 +45,9 @@ type fakePortal struct {
 	// vanished are pods still listed whose log read finds them gone: deleted
 	// between the listing and the read.
 	vanished map[string]bool
+	// refuseSinceTime answers a read that names sinceTime 400, with these
+	// words: a portal that refuses the parameter rather than ignoring it.
+	refuseSinceTime string
 	// logs503 answers every log read with 503 and this body.
 	logs503 string
 
@@ -99,12 +102,32 @@ func newPortal(t *testing.T) (*fakePortal, *httptest.Server) {
 // line, the last tail of them (500 when none is asked for). A pod the
 // namespace does not run is 404, a container the pod does not run 400 — or,
 // from a legacy portal, both a 500 in the apiserver's words.
+//
+// sinceTime is read as the cluster reads it: to the second, so every line of
+// that second comes back, and the lines before it do not. since and sinceTime
+// together are refused. A legacy portal ignores sinceTime altogether.
 func (p *fakePortal) log(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	p.logQ = append(p.logQ, q)
 	if p.logs503 != "" {
 		http.Error(w, p.logs503, http.StatusServiceUnavailable)
 		return
+	}
+	var from time.Time
+	if v := q.Get("sinceTime"); v != "" && !p.legacy {
+		t, err := time.Parse(time.RFC3339Nano, v)
+		switch {
+		case p.refuseSinceTime != "":
+			http.Error(w, p.refuseSinceTime, http.StatusBadRequest)
+			return
+		case err != nil:
+			http.Error(w, fmt.Sprintf("sinceTime %q is no RFC 3339 time", v), http.StatusBadRequest)
+			return
+		case q.Has("since"):
+			http.Error(w, "bad log query: since and sinceTime both bound the lines — give one", http.StatusBadRequest)
+			return
+		}
+		from = t.Truncate(time.Second)
 	}
 	pod, container := q.Get("pod"), q.Get("container")
 	key := pod + "/" + container
@@ -138,6 +161,16 @@ func (p *fakePortal) log(w http.ResponseWriter, r *http.Request) {
 	case !contains(listed.Containers, container):
 		http.Error(w, fmt.Sprintf("container %s is not valid for pod %s", container, pod), http.StatusBadRequest)
 		return
+	}
+	if !from.IsZero() {
+		var kept []string
+		for _, l := range lines {
+			ts, _, _ := strings.Cut(l, " ")
+			if t, err := time.Parse(time.RFC3339Nano, ts); err != nil || !t.Before(from) {
+				kept = append(kept, l)
+			}
+		}
+		lines = kept
 	}
 	tail := 500
 	if n, err := strconv.Atoi(q.Get("tail")); err == nil && n > 0 {
@@ -176,6 +209,12 @@ func at(s int) string {
 
 // line is a log line as the cluster stamps it.
 func line(s int, text string) string { return at(s) + " " + text }
+
+// lineAfter is a log line stamped d after the moment at(0) names, to the
+// nanosecond, as the cluster stamps the lines of one busy second.
+func lineAfter(d time.Duration, text string) string {
+	return time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC).Add(d).Format(time.RFC3339Nano) + " " + text
+}
 
 // owned is a pod as the portal lists it: with the workload that runs it, and
 // that workload's kind.

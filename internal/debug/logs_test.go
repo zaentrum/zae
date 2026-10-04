@@ -362,14 +362,132 @@ func TestFollowPrintsEachLineOnceThroughARollout(t *testing.T) {
 			t.Errorf("the notes lack %q: %q", s, errs)
 		}
 	}
-	// After the first read, each one asks for the window since the last —
-	// a few seconds, not the whole log again — and as many lines as the
-	// portal gives.
+	// After the first read, each one asks for the lines from the newest one
+	// printed on — not the whole log again — and as many as the portal gives.
+	// The one container read by window is the new replica, before it had
+	// printed a line: a few seconds since the follow began. Never both.
+	windows := 0
 	for _, q := range p.logQ[2:] {
-		since, _ := strconv.Atoi(q.Get("since"))
-		if q.Get("tail") != strconv.Itoa(maxTail) || since < 1 || since > 8 {
+		switch {
+		case q.Get("tail") != strconv.Itoa(maxTail) || q.Has("since") == q.Has("sinceTime"):
 			t.Errorf("a follow read asked for %v", q)
+		case q.Has("since"):
+			windows++
+			if since, _ := strconv.Atoi(q.Get("since")); since < 1 || since > 8 || q.Get("pod") != "chino-api-5f6d8c9b7d-wv2bn" {
+				t.Errorf("only a container with no line printed is read by window, a few seconds: %v", q)
+			}
 		}
+	}
+	if windows != 1 {
+		t.Errorf("%d reads by window, want the new replica's first one only: %v", windows, p.logQ[2:])
+	}
+}
+
+// Each read asks for the lines from the newest one printed on, by that line's
+// own stamp — and the cluster answers every line of its second again, so they
+// are told apart by their stamps: each printed once, a late line with the
+// newest stamp included, and the next second's in order.
+func TestFollowReadsOnFromTheNewestLineItPrinted(t *testing.T) {
+	p, srv := newPortal(t)
+	exampleNamespace(p)
+	k := "postgres-0/postgres"
+	ms := time.Millisecond
+	p.logs[k] = []string{lineAfter(1100*ms, "a"), lineAfter(1200*ms, "b"), lineAfter(1300*ms, "c")}
+	p.onList = func(p *fakePortal, n int) {
+		switch n {
+		case 2:
+			p.logs[k] = append(p.logs[k], lineAfter(1300*ms, "c, written with b and c"), lineAfter(1400*ms, "d"))
+		case 3:
+			p.logs[k] = append(p.logs[k], lineAfter(2050*ms, "e"))
+		case 5:
+			go interrupt()
+		}
+	}
+	code, out, errs := run(t, "logs", "postgres", "--url", srv.URL, "--follow")
+	if code != 130 {
+		t.Fatalf("want 130, got %d\n%s\n%s", code, out, errs)
+	}
+	want := []string{lineAfter(1100*ms, "a"), lineAfter(1200*ms, "b"), lineAfter(1300*ms, "c"),
+		lineAfter(1300*ms, "c, written with b and c"), lineAfter(1400*ms, "d"), lineAfter(2050*ms, "e")}
+	for i := range want {
+		want[i] = "[postgres-0/postgres] " + want[i]
+	}
+	if got := strings.Split(strings.TrimSpace(out), "\n"); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("each line once, in order:\n got:\n%s\nwant:\n%s", out, strings.Join(want, "\n"))
+	}
+	// Round by round, from the newest stamp printed before it.
+	for i, from := range []time.Duration{1300 * ms, 1400 * ms, 2050 * ms} {
+		q := p.logQ[1+i]
+		if q.Has("since") || q.Get("sinceTime") != strings.Fields(lineAfter(from, ""))[0] {
+			t.Errorf("read %d asked for %v, want the lines from %s on", 1+i, q, strings.Fields(lineAfter(from, ""))[0])
+		}
+	}
+	if strings.Contains(errs, "sinceTime") {
+		t.Errorf("a portal that reads sinceTime is followed by it, without a word:\n%s", errs)
+	}
+}
+
+// A portal-api older than sinceTime ignores it, and answers the log's last
+// lines — older ones among them. The follow says so once, reads by window from
+// then on, and still prints each line once.
+func TestFollowReadsByWindowWhereSinceTimeIsIgnored(t *testing.T) {
+	p, srv := newPortal(t)
+	exampleNamespace(p)
+	p.legacy = true
+	k := "postgres-0/postgres"
+	p.logs[k] = []string{line(1, "first"), line(2, "second")}
+	p.onList = func(p *fakePortal, n int) {
+		switch n {
+		case 3:
+			p.logs[k] = append(p.logs[k], line(3, "third"))
+		case 5:
+			go interrupt()
+		}
+	}
+	code, out, errs := run(t, "logs", "postgres-0", "--url", srv.URL, "--follow")
+	if code != 130 {
+		t.Fatalf("want 130, got %d\n%s\n%s", code, out, errs)
+	}
+	if want := line(1, "first") + "\n" + line(2, "second") + "\n" + line(3, "third") + "\n"; out != want {
+		t.Fatalf("each line once:\n got:\n%s\nwant:\n%s", out, want)
+	}
+	if n := strings.Count(errs, "does not read sinceTime — reading the window since each read instead"); n != 1 {
+		t.Errorf("said %d times, want once:\n%s", n, errs)
+	}
+	if !p.logQ[1].Has("sinceTime") {
+		t.Errorf("the first round asks by sinceTime: %v", p.logQ[1])
+	}
+	for _, q := range p.logQ[2:] {
+		if q.Has("sinceTime") || !q.Has("since") {
+			t.Errorf("after the portal ignored it, every read is by window: %v", q)
+		}
+	}
+}
+
+// A portal that refuses sinceTime is followed by window from the next round
+// on, and nothing it wrote meanwhile is lost.
+func TestFollowReadsByWindowWhereSinceTimeIsRefused(t *testing.T) {
+	p, srv := newPortal(t)
+	exampleNamespace(p)
+	p.refuseSinceTime = `sinceTime "…" is no RFC 3339 time`
+	k := "postgres-0/postgres"
+	p.onList = func(p *fakePortal, n int) {
+		switch n {
+		case 2:
+			p.logs[k] = append(p.logs[k], line(5, "written while the read was refused"))
+		case 5:
+			go interrupt()
+		}
+	}
+	code, out, errs := run(t, "logs", "postgres-0", "--url", srv.URL, "--follow")
+	if code != 130 {
+		t.Fatalf("a refused sinceTime does not end a follow: want 130, got %d\n%s\n%s", code, out, errs)
+	}
+	if !strings.Contains(out, "written while the read was refused") || strings.Count(out, "database system is ready") != 1 {
+		t.Errorf("each line once, the one written meanwhile too:\n%s", out)
+	}
+	if !strings.Contains(errs, "refuses sinceTime") || strings.Count(errs, "reading the window since each read instead") != 1 {
+		t.Errorf("said once, in the portal's words:\n%s", errs)
 	}
 }
 
@@ -526,13 +644,14 @@ func TestFollowPrintsALateLineWithTheNewestStamp(t *testing.T) {
 	}
 }
 
-// Each read after the first asks for the window since the read before it,
-// widened by the margin — measured on this machine's clock, here a minute a
-// round — not for everything since the follow began, and never for less
-// than the margin.
+// A container that has printed no line yet is read by window: each read after
+// the first asks for the window since the read before it, widened by the
+// margin — measured on this machine's clock, here a minute a round — not for
+// everything since the follow began, and never for less than the margin.
 func TestFollowReadsTheWindowSinceTheLastRead(t *testing.T) {
 	p, srv := newPortal(t)
 	exampleNamespace(p)
+	p.logs["postgres-0/postgres"] = []string{}
 	clock := time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)
 	now = func() time.Time { return clock }
 	t.Cleanup(func() { now = time.Now })

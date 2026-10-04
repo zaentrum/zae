@@ -1,6 +1,8 @@
 package debug
 
 import (
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/zaentrum/zae/internal/exitcode"
@@ -11,10 +13,20 @@ import (
 //
 // The portal has no stream to subscribe to — the console's "live" button
 // reads the log again every few seconds, and so does this. Each read asks for
-// the window since the last one, widened by followMargin, and prints only the
-// lines newer than the newest it printed: the cluster stamps every line, to
+// the lines from the newest one printed on (sinceTime, that line's own stamp),
+// and prints only the lines newer than it: the cluster stamps every line, to
 // the nanosecond, so a line read twice is recognised by its stamp and not by
-// guessing at overlaps.
+// guessing at overlaps. And lines ARE read twice: the cluster reads sinceTime
+// to the second, so the whole second of the newest line comes back — on the
+// demo, a sinceTime in the middle of a second answered all seventeen lines of
+// it, eight of them from before the time asked for.
+//
+// A container with no line printed yet is read by window instead — the
+// seconds since the last read, widened by followMargin, measured on this
+// machine's clock — since a time from this clock means nothing to the
+// cluster's. So is every container against a portal-api that ignores
+// sinceTime or refuses it: the window is how a follow read before there was
+// sinceTime, and it still works there.
 type followed struct {
 	src source
 	// last is the newest timestamp printed; atLast the lines printed at
@@ -66,6 +78,26 @@ func (f *followed) remember(es []entry) {
 // lines on stdout stay the log.
 func note(format string, a ...any) { errf("note: "+format, a...) }
 
+// ignoredSinceTime reports whether a read answered lines from before the
+// second it asked for: the cluster reads sinceTime to the second, so the lines
+// of that second come back — and nothing older does, unless the portal did not
+// read the parameter at all.
+func ignoredSinceTime(es []entry, since time.Time) bool {
+	floor := since.Truncate(time.Second)
+	for _, e := range es {
+		if !e.at.IsZero() && e.at.Before(floor) {
+			return true
+		}
+	}
+	return false
+}
+
+// refusesSinceTime reports whether a read was refused for its sinceTime.
+func refusesSinceTime(err error) bool {
+	ae, ok := asAPIError(err)
+	return ok && ae.status == http.StatusBadRequest && strings.Contains(ae.said, "sinceTime")
+}
+
 // stopsAFollow reports whether a failure ends a follow: a refused bearer, or
 // an instance with nothing to read, does not get better by asking again. A pod
 // that went, or a container a pod no longer runs, is a rollout under way —
@@ -93,6 +125,17 @@ func followLogs(s *session, c *client, name, container string, srcs []source, fi
 	for _, src := range srcs {
 		track(src)
 	}
+	// bySinceTime: this portal-api reads the lines from a moment on. Assumed
+	// until a read shows otherwise — one that ignores the parameter answers
+	// lines older than it, one that refuses it says so — and then every read
+	// is by window, as it was before there was sinceTime.
+	bySinceTime := true
+	byWindow := func(why string) {
+		if bySinceTime {
+			bySinceTime = false
+			note("%s %s — reading the window since each read instead", c.base, why)
+		}
+	}
 
 	// read reads one container and returns the lines it has not printed, or
 	// a failure that ends the follow.
@@ -107,6 +150,12 @@ func followLogs(s *session, c *client, name, container string, srcs []source, fi
 				note("%s is gone — still following %s", f.src, name)
 			}
 			return nil, exitcode.OK, false
+		case err != nil && !q.sinceTime.IsZero() && refusesSinceTime(err):
+			// The next round reads this container by window, from the read
+			// before: nothing is lost by the one that was refused.
+			ae, _ := asAPIError(err)
+			byWindow("refuses sinceTime (" + ae.said + ")")
+			return nil, exitcode.OK, false
 		case err != nil && stopsAFollow(err):
 			return nil, fail(err), true
 		case err != nil:
@@ -119,6 +168,11 @@ func followLogs(s *session, c *client, name, container string, srcs []source, fi
 		if f.trouble != "" || f.gone {
 			f.trouble, f.gone = "", false
 			note("reading %s again", f.src)
+		}
+		if !q.sinceTime.IsZero() && ignoredSinceTime(es, q.sinceTime) {
+			// What came back is still told apart by its stamps, so this round
+			// prints right all the same; the next ones ask for less.
+			byWindow("does not read sinceTime")
 		}
 		fresh := es
 		if f.read {
@@ -196,14 +250,21 @@ func followLogs(s *session, c *client, name, container string, srcs []source, fi
 		batch = batch[:0]
 		for _, src := range order {
 			f := tracked[src]
-			// A container read before is read from where that read began; one
-			// never read — a new pod, or one that was not up yet — from when
-			// the follow began: everything it wrote since is new here.
-			from := start
-			if f.read {
-				from = f.readAt
+			// A container with a line printed is read from that line's stamp on:
+			// the cluster's own clock, so nothing in between is lost to this
+			// machine's. One with none — or against a portal-api that does not
+			// read sinceTime — by window: a container read before from where
+			// that read began; one never read — a new pod, or one that was not up
+			// yet — from when the follow began: everything it wrote since is new
+			// here.
+			q := query{tail: maxTail, sinceTime: f.last}
+			if !bySinceTime || !f.read || f.last.IsZero() {
+				from := start
+				if f.read {
+					from = f.readAt
+				}
+				q = query{tail: maxTail, since: seconds(round.Sub(from) + followMargin)}
 			}
-			q := query{tail: maxTail, since: seconds(round.Sub(from) + followMargin)}
 			es, code, stop := read(f, q, round)
 			if stop {
 				return code

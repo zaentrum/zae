@@ -343,8 +343,13 @@ func contains(ss []string, s string) bool {
 	return false
 }
 
-// query is what one read asks for: lines per container, and how far back.
-type query struct{ tail, since int }
+// query is what one read asks for: lines per container, and how far back —
+// a window of seconds before now, or the lines from a moment on. The portal
+// takes one of since and sinceTime, never both.
+type query struct {
+	tail, since int
+	sinceTime   time.Time
+}
 
 // seconds rounds a duration up to whole seconds, which is what the portal
 // takes; zero stays zero.
@@ -360,7 +365,10 @@ func logPath(src source, q query) string {
 	if q.tail > 0 {
 		v.Set("tail", strconv.Itoa(q.tail))
 	}
-	if q.since > 0 {
+	switch {
+	case !q.sinceTime.IsZero():
+		v.Set("sinceTime", q.sinceTime.UTC().Format(time.RFC3339Nano))
+	case q.since > 0:
 		v.Set("since", strconv.Itoa(q.since))
 	}
 	return logsPath + "?" + v.Encode()
