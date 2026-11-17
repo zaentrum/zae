@@ -3,6 +3,15 @@ on:
   push: { branches: [main] }
   pull_request: {}
 jobs:
+  # The organisation's shared neutrality check.
+  neutrality:
+    permissions:
+      contents: read
+    uses: zaentrum/.github/.github/workflows/neutrality.yml@v1
+    with:
+      exceptions: |
+        .github/workflows/ci.yml  holds the older neutrality check until the shared check replaces it
+
   test:
     runs-on: ubuntu-latest
     steps:
