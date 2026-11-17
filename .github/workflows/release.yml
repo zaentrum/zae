@@ -16,6 +16,10 @@ on:
         type: string
 permissions:
   contents: write
+  # id-token and attestations: the workflow's own identity signs the record
+  # of the build of every file the release publishes: there is no key to keep.
+  id-token: write
+  attestations: write
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
@@ -37,3 +41,28 @@ jobs:
           # carries both tags, and left to choose GoReleaser takes the
           # pre-release's.
           GORELEASER_CURRENT_TAG: ${{ inputs.tag || github.ref_name }}
+      # The list of the packages the binaries hold, read from the binaries.
+      - uses: anchore/sbom-action@v0
+        with:
+          path: dist
+          format: spdx-json
+          output-file: zae.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      # The build's record of every file the release publishes (which
+      # repository, which commit, which workflow), signed by this workflow.
+      # A run started by hand records main's workflow and commit, the run's
+      # own; the files it records are built from the tag's source.
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt
+      # The list, attached to each archive the same way.
+      - uses: actions/attest-sbom@v4
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+          sbom-path: zae.spdx.json
