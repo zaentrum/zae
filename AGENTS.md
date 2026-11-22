@@ -85,5 +85,5 @@ the session `zae login --url …` stored in `~/.config/zae/credentials.json` (un
 ## Before a pull request
 
 - `gofmt -w .`: `ci.yml` fails on any file gofmt would change.
-- `ci.yml`'s neutrality gate fails on an internal hostname or the name of a download
-  tool in a `.go`, `.md` or `.sh` file.
+- The organisation's shared check, the workflow's `neutrality` job, is the one
+  neutrality check.

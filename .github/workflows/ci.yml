@@ -8,9 +8,6 @@ jobs:
     permissions:
       contents: read
     uses: zaentrum/.github/.github/workflows/neutrality.yml@v1
-    with:
-      exceptions: |
-        .github/workflows/ci.yml  holds the older neutrality check until the shared check replaces it
 
   test:
     runs-on: ubuntu-latest
@@ -22,12 +19,3 @@ jobs:
       - run: go vet ./...
       - run: go test ./...
       - run: go build ./...
-      # Neutrality: this is a public repo of the platform org. The binary must
-      # never name internal infrastructure or acquisition tooling — its whole
-      # design is that it learns capability from the instance, not from code.
-      - name: neutrality gate
-        run: |
-          H="$(printf '%s' 'nalet' '\.' 'cloud')|$(printf '%s' 'implentic' '\.' 'com')"
-          T1='nzb''get'; T2='qbit''torrent'; T3='son''arr'; T4='rad''arr'; T5='prow''larr'
-          ! grep -rniE "$H|\b($T1|$T2|$T3|$T4|$T5)\b" --include="*.go" --include="*.md" --include="*.sh" . \
-            || { echo "::error::internal hostname or acquisition tool name in the public CLI"; exit 1; }
